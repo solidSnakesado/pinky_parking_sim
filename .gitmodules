@@ -1,0 +1,3 @@
+[submodule "pinky_pro"]
+	path = pinky_pro
+	url = https://github.com/pinklab-art/pinky_pro.git
