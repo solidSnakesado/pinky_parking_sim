@@ -5,7 +5,7 @@ Classes: 0 wheel, 1 line (black tape), 2 body (robot body, wheels excluded).
 Robot poses are sampled in the parking board (random, approaching, parked front-in / rear-in),
 with camera, light and image randomisation. The camera is the calibrated real webcam
 (NOVOMAX NC-150, 640x480) including its radial lens distortion. pinky_pro is not modified.
-A poses.csv with the ground-truth robot pose of every image is written next to data.yaml.
+A poses.csv with the ground-truth robot pose and the actual camera pose of every image is written next to data.yaml.
 
 usage:
   train+val : python gen_parking_dataset.py --count 2000                      (val = --val fraction, seed 0)
@@ -274,7 +274,7 @@ def main():
     new_csv = not pose_csv.exists()
     csv = open(pose_csv, 'a')
     if new_csv:
-        csv.write('split,name,kind,x_m,y_m,yaw_rad,u_mm,v_mm,cam_dx,cam_dy,cam_dz,light_scale\n')
+        csv.write('split,name,kind,x_m,y_m,yaw_rad,u_mm,v_mm,cam_x,cam_y,cam_z,cam_qw,cam_qx,cam_qy,cam_qz,light_scale\n')
     rng = np.random.default_rng(args.seed)
     n_val = int(round(args.count * args.val))
 
@@ -331,8 +331,9 @@ def main():
 
         name = f'{k:05d}_{kind}'
         u_mm, v_mm = world_to_mm(x, y)
+        cp, cq = model.cam_pos[cam_id], model.cam_quat[cam_id]     # actual (jittered) camera pose, world frame
         csv.write(f'{split},{name},{kind},{x:.4f},{y:.4f},{yaw:.4f},{u_mm:.1f},{v_mm:.1f},'
-                  f'{cam_d[0]:.4f},{cam_d[1]:.4f},{cam_d[2]:.4f},{scale:.3f}\n')
+                  f'{cp[0]:.5f},{cp[1]:.5f},{cp[2]:.5f},{cq[0]:.6f},{cq[1]:.6f},{cq[2]:.6f},{cq[3]:.6f},{scale:.3f}\n')
         image.save(out / 'images' / split / f'{name}.jpg', quality=95)
         with open(out / 'labels' / split / f'{name}.txt', 'w') as fh:
             for cls, poly in labels:
