@@ -4,6 +4,7 @@
 usage:
   python tools/eval_pose.py --method pa --split val
   python tools/eval_pose.py --method pa --split test --out results/pa_test.csv
+  python tools/eval_pose.py --method ps --weights runs/segment/runs/ps/yolo11n_seed0/weights/best.pt --split val
 
 Every method returns wheel masks + a body mask; the pose is computed by the shared
 parking_geom.pose_from_masks, so methods differ only in how the masks are found.
@@ -34,10 +35,16 @@ def load_rows(data, split):
     return rows
 
 
-def get_method(name):
+def get_method(name, weights=None):
     if name == 'pa':
         import pa_rule
         return pa_rule.detect
+    if name == 'ps':
+        if not weights:
+            raise SystemExit('--weights is required for ps')
+        import ps_seg
+        ps_seg.load(os.path.expanduser(weights))
+        return ps_seg.detect
     raise SystemExit(f'unknown method {name}')
 
 
@@ -59,6 +66,7 @@ def main():
     ap.add_argument('--data', default='~/dev_ws/pinky_parking_sim/datasets/parking_seg_v2')
     ap.add_argument('--split', default='val', choices=['train', 'val', 'test'])
     ap.add_argument('--method', default='pa')
+    ap.add_argument('--weights', default=None, help='model weights for learned methods (ps)')
     ap.add_argument('--out', default=None, help='per-image result csv (default results/<method>_<split>.csv)')
     ap.add_argument('--debug', type=int, default=10, help='overlay images to write next to the csv')
     args = ap.parse_args()
@@ -69,7 +77,7 @@ def main():
     dbg = out.with_suffix('')
     if args.debug:
         dbg.mkdir(exist_ok=True)
-    detect = get_method(args.method)
+    detect = get_method(args.method, args.weights)
     rows = load_rows(data, args.split)
     res = []
     t_total = 0.0
