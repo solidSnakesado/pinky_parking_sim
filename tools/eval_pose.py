@@ -4,6 +4,7 @@
 usage:
   python tools/eval_pose.py --method pa --split val
   python tools/eval_pose.py --method pa --split test --out results/pa_test.csv
+  python tools/eval_pose.py --method pb --split val     (after tools/gen_background.py --split val)
   python tools/eval_pose.py --method ps --weights runs/segment/runs/ps/yolo11n_seed0/weights/best.pt --split val
 
 Every method returns wheel masks + a body mask; the pose is computed by the shared
@@ -35,16 +36,27 @@ def load_rows(data, split):
     return rows
 
 
-def get_method(name, weights=None):
+def get_method(name, data, split, weights=None):
+    """Returns detect(image, camera, row) -> (wheel_masks, body_mask)."""
     if name == 'pa':
         import pa_rule
-        return pa_rule.detect
+        return lambda img, cam, row: pa_rule.detect(img, cam)
     if name == 'ps':
         if not weights:
             raise SystemExit('--weights is required for ps')
         import ps_seg
         ps_seg.load(os.path.expanduser(weights))
-        return ps_seg.detect
+        return lambda img, cam, row: ps_seg.detect(img, cam)
+    if name == 'pb':
+        import pb_bgsub
+        bg_dir = data / 'background' / split
+        if not bg_dir.is_dir():
+            raise SystemExit(f'no backgrounds in {bg_dir}: run tools/gen_background.py --split {split}')
+        # backgrounds are loaded before timing (a real node keeps its one background in memory)
+        bgs = {p.stem: cv2.imread(str(p)) for p in bg_dir.glob('*.png')}
+        def detect(img, cam, row):
+            return pb_bgsub.detect(img, cam, bgs[row['name']])
+        return detect
     raise SystemExit(f'unknown method {name}')
 
 
@@ -77,7 +89,7 @@ def main():
     dbg = out.with_suffix('')
     if args.debug:
         dbg.mkdir(exist_ok=True)
-    detect = get_method(args.method, args.weights)
+    detect = get_method(args.method, data, args.split, args.weights)
     rows = load_rows(data, args.split)
     res = []
     t_total = 0.0
@@ -85,7 +97,7 @@ def main():
         img = cv2.imread(str(data / 'images' / args.split / f"{r['name']}.jpg"))
         cam = G.Camera.from_row(r)
         t0 = time.perf_counter()
-        wheels, body = detect(img, cam)
+        wheels, body = detect(img, cam, r)
         pose = G.pose_from_masks(cam, wheels, body)
         t_total += time.perf_counter() - t0
         item = {'name': r['name'], 'kind': r['kind'], 'found': pose is not None, 'n_wheels': len(wheels),
