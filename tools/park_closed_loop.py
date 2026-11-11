@@ -226,26 +226,129 @@ class Controller:
 
 
 # ---------------------------------------------------------------- rendering / video
-def draw_overlay(img, cam, gt, est, slot, mode, phase, contact, t):
-    vis = img.copy()
-    su = D.SLOT_U[slot]
-    box = [D.mm_to_world(u, v) for u, v in ((su - 95, 19), (su + 95, 19), (su + 95, 220), (su - 95, 220))]
-    pix = cam.project(np.array([[p[0], p[1], 0.002] for p in box]))
-    cv2.polylines(vis, [np.round(pix).astype(np.int32)], True, (0, 200, 255), 2)
+PANEL_W = 300
+METHOD_NAME = {'pa': 'P-A 규칙', 'pb': 'P-B 배경 차분', 'ps': 'P-S 세그멘테이션'}
+PHASE_NAME = {'settle': '초기 확인', 'turn_to': '회전', 'turn': '정렬 회전', 'go': '이동', 'hold': '주차 완료', 'done': '종료'}
 
-    def arrow(p, color):
-        q = cam.project(np.array([[p[0], p[1], 0.03], [p[0] + 0.08 * math.cos(p[2]), p[1] + 0.08 * math.sin(p[2]), 0.03]]))
-        cv2.arrowedLine(vis, tuple(np.round(q[0]).astype(int)), tuple(np.round(q[1]).astype(int)), color, 2, tipLength=0.3)
-    arrow(gt, (0, 200, 0))
-    if est is not None:
-        arrow(est, (0, 0, 255))
-    cv2.putText(vis, f'slot {"ABCD"[slot]} {mode}  {phase}  t={t:4.1f}s', (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (0, 0, 0), 2, cv2.LINE_AA)
-    cv2.putText(vis, 'green: truth  red: estimate', (8, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-    if contact:
-        cv2.rectangle(vis, (0, 0), (vis.shape[1] - 1, vis.shape[0] - 1), (0, 0, 255), 6)
-        cv2.putText(vis, 'TAPE CONTACT', (420, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
-    return vis
+
+def find_korean_font():
+    """A font file that has Hangul (fontconfig first, then common paths); None -> English labels."""
+    import subprocess
+    try:
+        out = subprocess.run(['fc-list', ':lang=ko', 'file'], capture_output=True, text=True, timeout=5).stdout
+        files = [l.split(':')[0].strip() for l in out.splitlines() if l.strip()]
+        files.sort(key=lambda f: (('Sans' not in f and 'Gothic' not in f), 'Bold' in f, f))
+        if files:
+            return files[0]
+    except Exception:
+        pass
+    for f in ('/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+              '/usr/share/fonts/truetype/nanum/NanumGothic.ttf'):
+        if os.path.exists(f):
+            return f
+    return None
+
+
+def target_errors(pose, slot, mode):
+    """(lateral mm, depth mm, heading deg) of a pose against the slot target; depth > 0 = not deep enough."""
+    tx, ty = D.mm_to_world(D.SLOT_U[slot], PARK_V[mode])[:2]
+    final_yaw = 0.0 if mode == 'front' else math.pi
+    return (abs(pose[1] - ty) * 1000, (tx - pose[0]) * 1000,
+            abs(math.degrees(G.wrap(pose[2] - final_yaw))))
+
+
+class Overlay:
+    """Ceiling image with slot / arrows + a Korean side panel with live errors and the verdict."""
+
+    def __init__(self, method):
+        from PIL import ImageFont
+        path = find_korean_font()
+        self.ko = path is not None
+        self.font = ImageFont.truetype(path, 17) if path else ImageFont.load_default()
+        self.small = ImageFont.truetype(path, 14) if path else ImageFont.load_default()
+        self.big = ImageFont.truetype(path, 26) if path else ImageFont.load_default()
+        self.method = METHOD_NAME[method] if self.ko else method.upper()
+
+    def draw(self, img, cam, gt, est, slot, mode, phase, contact_now, contact_ms, t, verdict):
+        from PIL import Image, ImageDraw
+        vis = img.copy()
+        su = D.SLOT_U[slot]
+        box = [D.mm_to_world(u, v) for u, v in ((su - 95, 19), (su + 95, 19), (su + 95, 220), (su - 95, 220))]
+        pix = cam.project(np.array([[p[0], p[1], 0.002] for p in box]))
+        cv2.polylines(vis, [np.round(pix).astype(np.int32)], True, (0, 200, 255), 2)
+
+        def arrow(p, color):
+            q = cam.project(np.array([[p[0], p[1], 0.03],
+                                      [p[0] + 0.08 * math.cos(p[2]), p[1] + 0.08 * math.sin(p[2]), 0.03]]))
+            cv2.arrowedLine(vis, tuple(np.round(q[0]).astype(int)), tuple(np.round(q[1]).astype(int)), color, 2,
+                            tipLength=0.3)
+        arrow(gt, (0, 200, 0))
+        if est is not None:
+            arrow(est, (0, 0, 255))
+        if contact_now:
+            cv2.rectangle(vis, (0, 0), (vis.shape[1] - 1, vis.shape[0] - 1), (0, 0, 255), 6)
+
+        canvas = Image.new('RGB', (vis.shape[1] + PANEL_W, vis.shape[0]), 'white')
+        canvas.paste(Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)), (0, 0))
+        d = ImageDraw.Draw(canvas)
+        x0, y = vis.shape[1] + 14, 12
+        black, grey, red, green = (20, 20, 20), (110, 110, 110), (210, 30, 30), (20, 140, 40)
+        L = (lambda ko, en: ko if self.ko else en)
+        mode_txt = L('전면' if mode == 'front' else '후면', mode)
+        d.text((x0, y), self.method, font=self.font, fill=black); y += 26
+        d.text((x0, y), L(f'목표: {"ABCD"[slot]}칸 {mode_txt} 주차', f'target: slot {"ABCD"[slot]} {mode_txt}'),
+               font=self.font, fill=black); y += 26
+        d.text((x0, y), L(f'단계: {PHASE_NAME.get(phase, phase)}   {t:4.1f} s', f'phase: {phase}  {t:4.1f} s'),
+               font=self.font, fill=black); y += 36
+
+        d.text((x0 + 92, y), L('실제', 'truth'), font=self.small, fill=grey)
+        d.text((x0 + 182, y), L('추정', 'estimate'), font=self.small, fill=grey); y += 22
+        g = target_errors(gt, slot, mode)
+        e = target_errors(est, slot, mode) if est is not None else None
+        limits = (OK_LATERAL_MM, OK_DEPTH_MM, OK_YAW_DEG)
+        rows = [(L('좌우 오차', 'lateral'), '{:.1f} mm'), (L('깊이 오차', 'depth'), '{:.1f} mm'),
+                (L('방향 오차', 'heading'), '{:.1f}°')]
+        for i, (name, fmt) in enumerate(rows):
+            d.text((x0, y), name, font=self.font, fill=black)
+            gv = abs(g[i])
+            d.text((x0 + 92, y), fmt.format(gv), font=self.font, fill=red if gv > limits[i] else black)
+            d.text((x0 + 182, y), '-' if e is None else fmt.format(abs(e[i])), font=self.font, fill=grey)
+            y += 26
+        d.text((x0, y), L('테이프 접촉', 'tape contact'), font=self.font, fill=black)
+        d.text((x0 + 92, y), L('있음', 'yes') + f' ({contact_ms} ms)' if contact_ms else L('없음', 'none'),
+               font=self.font, fill=red if contact_ms else black); y += 30
+        d.text((x0, y), L('기준: 좌우·깊이 ≤ 20 mm, 방향 ≤ 5°', 'limits: 20 mm, 20 mm, 5°'), font=self.small,
+               fill=grey); y += 20
+        d.text((x0, y), L('실제 = 정답 자세 기준(판정에 사용)', 'truth = ground truth (scored)'), font=self.small,
+               fill=grey); y += 18
+        d.text((x0, y), L('추정 = 제어기가 보는 값', 'estimate = what the controller sees'), font=self.small,
+               fill=grey); y += 30
+        d.text((x0, y), L('초록 화살표 = 정답, 빨강 = 추정', 'green = truth, red = estimate'), font=self.small,
+               fill=grey); y += 18
+        d.text((x0, y), L('노란 상자 = 목표 칸', 'yellow box = target slot'), font=self.small, fill=grey); y += 30
+        if verdict is not None:
+            ok, reasons = verdict
+            d.text((x0, y), L('결과: 성공', 'SUCCESS') if ok else L('결과: 실패', 'FAIL'), font=self.big,
+                   fill=green if ok else red); y += 34
+            for r in reasons:
+                d.text((x0, y), r, font=self.small, fill=red); y += 18
+        return cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGB2BGR)
+
+
+def verdict_of(gt, slot, mode, contact_ms, finished, ko=True):
+    lat, dep, yaw = target_errors(gt, slot, mode)
+    reasons = []
+    if contact_ms:
+        reasons.append('테이프 접촉' if ko else 'tape contact')
+    if lat > OK_LATERAL_MM:
+        reasons.append(f'좌우 오차 {lat:.1f} mm > {OK_LATERAL_MM:.0f}' if ko else f'lateral {lat:.1f} mm')
+    if abs(dep) > OK_DEPTH_MM:
+        reasons.append(f'깊이 오차 {abs(dep):.1f} mm > {OK_DEPTH_MM:.0f}' if ko else f'depth {abs(dep):.1f} mm')
+    if yaw > OK_YAW_DEG:
+        reasons.append(f'방향 오차 {yaw:.1f}° > {OK_YAW_DEG:.0f}°' if ko else f'heading {yaw:.1f} deg')
+    if not finished:
+        reasons.append('시간 초과' if ko else 'time out')
+    return (not reasons, reasons)
 
 
 def main():
@@ -267,6 +370,7 @@ def main():
     out = Path(args.out or f'results/park_{args.method}')
     out.mkdir(parents=True, exist_ok=True)
     detect = detector(args.method, args.weights)
+    overlay = Overlay(args.method)
     W, H = 640, 480
     model, f, rw, rh = D.build(os.path.expanduser(args.model), W, H)
     data = mujoco.MjData(model)
@@ -317,7 +421,7 @@ def main():
         filt, ctrl = Filter(), Controller(plan(slot, mode))
         writer = None
         if k < args.video:
-            writer = cv2.VideoWriter(str(out / f'trial_{k:03d}.mp4'), cv2.VideoWriter_fourcc(*'mp4v'), 10, (W, H))
+            writer = cv2.VideoWriter(str(out / f'trial_{k:03d}.mp4'), cv2.VideoWriter_fourcc(*'mp4v'), 10, (W + PANEL_W, H))
         t, next_frame, contact_steps, touched, n_meas, n_frames = 0.0, 0.0, 0, set(), 0, 0
         t_wall = time.perf_counter()
         while ctrl.name != 'done' and t < TIME_LIMIT_S:
@@ -343,8 +447,10 @@ def main():
                           f'est=({filt.state[0]:.3f},{filt.state[1]:.3f},{math.degrees(filt.state[2]):6.1f}) '
                           f'meas={None if pose is None else (round(pose[0],3), round(pose[1],3), round(math.degrees(pose[2]),1))}')
                 if writer is not None:
-                    writer.write(draw_overlay(img, cam, (robot.x, robot.y, robot.yaw), filt.state, slot, mode,
-                                              ctrl.name, bool(hit), t))
+                    vd = (verdict_of((robot.x, robot.y, robot.yaw), slot, mode, contact_steps * 10, True, overlay.ko)
+                          if ctrl.name == 'hold' else None)
+                    writer.write(overlay.draw(img, cam, (robot.x, robot.y, robot.yaw), filt.state, slot, mode,
+                                              ctrl.name, bool(hit), contact_steps * 10, t, vd))
                 if viewer is not None:
                     if not viewer.is_running():
                         break
