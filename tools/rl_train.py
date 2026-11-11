@@ -20,6 +20,7 @@
   python tools/rl_train.py --name ppo_slot_seed0 --resume ppo_route_seed0_3m --steps 3000000   # 이어서 학습
   python tools/rl_train.py --name ppo_ps_seed0 --eval-only                # 저장된 최고 모델 평가:
                                                                           #   판별 결과 + 시간 초과 원인
+  python tools/rl_train.py --name ppo_ps_seed0 --eval-only --eval-area slot   # 진단: 칸 바로 앞에서 출발
   tensorboard --logdir runs/rl                                            # 그래프 (브라우저: localhost:6006)
 출력: runs/rl/<name>/  best_model.zip, best_vecnormalize.pkl, last_model.zip, last_vecnormalize.pkl,
       eval.csv (평가 1회당 한 줄), args.txt, tb/ (TensorBoard),
@@ -66,15 +67,15 @@ def _final_state(env):
             'stopped': bool(abs(v) < STOP_V and abs(w) < STOP_W), 'final_v': float(v), 'final_w': float(w)}
 
 
-def evaluate(model, vecnorm, env, episodes):
-    """고정 평가 판, 항상 입구 통로에서 출발: k번 판 -> 칸 k % 4, 방식은 4판마다 전면/후면을 번갈아,
-    출발 자세는 시드 EVAL_SEED0+k로 만듦.
+def evaluate(model, vecnorm, env, episodes, area='corridor'):
+    """고정 평가 판, 기본은 입구 통로에서 출발: k번 판 -> 칸 k % 4, 방식은 4판마다 전면/후면을 번갈아,
+    출발 자세는 시드 EVAL_SEED0+k로 만듦. area로 출발 구역을 바꿀 수 있음 (진단용: lane / slot).
     반환값: (요약, 판마다 최종 상태를 담은 행 목록)."""
     counts = {'success': 0, 'contact': 0, 'out': 0, 'timeout': 0}
     lat, dep, yaw, tim, rows = [], [], [], [], []
     for k in range(episodes):
         obs, start = env.reset(seed=EVAL_SEED0 + k, options={'slot': k % 4, 'mode': ('front', 'rear')[(k // 4) % 2],
-                                                                'area': 'corridor'})
+                                                                'area': area})
         done, min_dist = False, float('inf')
         while not done:
             action, _ = model.predict(vecnorm.normalize_obs(obs[None]), deterministic=True)
@@ -210,6 +211,9 @@ def main():
                     help='no training: load runs/rl/<name>/<which>_model + _vecnormalize, run the fixed evaluation, '
                          'print every episode and write eval_<which>_episodes.csv')
     ap.add_argument('--which', choices=['best', 'last'], default='best', help='model for --eval-only')
+    ap.add_argument('--eval-area', choices=['corridor', 'lane', 'slot'], default='corridor',
+                    help='--eval-only: start area of the evaluation episodes (diagnosis; training-time '
+                         'evaluation always uses corridor)')
     args = ap.parse_args()
 
     out = REPO / 'runs/rl' / args.name
@@ -221,13 +225,15 @@ def main():
                                     DummyVecEnv([lambda: ParkEnv(noise=args.noise)]))
         vecnorm.training = False
         t0 = time.time()
-        summary, rows = evaluate(model, vecnorm, ParkEnv(noise=args.noise), args.eval_episodes)
-        path = out / f'eval_{args.which}_episodes.csv'
+        summary, rows = evaluate(model, vecnorm, ParkEnv(noise=args.noise), args.eval_episodes, args.eval_area)
+        suffix = '' if args.eval_area == 'corridor' else f'_{args.eval_area}'
+        path = out / f'eval_{args.which}_episodes{suffix}.csv'
         with open(path, 'w', newline='') as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0]))
             w.writeheader()
             w.writerows(rows)
-        print(f'{args.name} / {args.which}_model, noise={args.noise}, {args.eval_episodes} fixed episodes '
+        print(f'{args.name} / {args.which}_model, noise={args.noise}, start area {args.eval_area}, '
+              f'{args.eval_episodes} fixed episodes '
               f'({time.time() - t0:.0f} s)\n')
         report(rows)
         print(f"\nsuccess {summary['success']:.1%}  contact {summary['contact']:.1%}  out {summary['out']:.1%}  "
