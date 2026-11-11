@@ -1,0 +1,2 @@
+trial,slot,mode,start_x,start_y,start_yaw_deg,finished,success,contact_ms,tapes_touched,lateral_mm,depth_mm,yaw_err_deg,front_back_ok,time_s,detect_rate
+0,B,rear,0.2463,0.7457,52.3,True,True,0,,1.5,4.2,0.1,True,19.7,1.0
