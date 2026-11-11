@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Tune P-B (background subtraction) thresholds on the val split only (test is never used here).
+"""P-B(배경 차분)의 임계값을 val 분할로만 튜닝한다(test는 여기서 쓰지 않음).
 
-For every parameter combination: run P-B on all val images and print
-position / heading median, front/back accuracy, and body-mask IoU against the ground-truth
-silhouette (how well the robot region was found). Pick the best row, put its values into
-tools/pb_bgsub.py, then evaluate test once with eval_pose.py.
+파라미터 조합마다 val 이미지 전체에 P-B를 돌려 다음을 출력한다:
+위치·방향 오차 중앙값, 앞/뒤 정확도, 정답 실루엣 대비 몸통 마스크 IoU(로봇 영역을 얼마나 잘 찾았는가).
+가장 좋은 줄을 골라 그 값을 tools/pb_bgsub.py에 넣은 뒤, eval_pose.py로 test를 한 번 평가한다.
 
-usage (pinky_venv):  python tools/tune_pb.py
+사용법 (pinky_venv):  python tools/tune_pb.py
 """
 import argparse
 import csv
@@ -25,7 +24,7 @@ import pb_bgsub as P  # noqa: E402
 
 GRID = {
     'DIFF_TH': [25, 40, 60],
-    'SHADOW_RATIO': [(0.45, 0.92), (0.3, 0.95), (0.0, 0.0)],     # (0, 0) = no shadow removal
+    'SHADOW_RATIO': [(0.45, 0.92), (0.3, 0.95), (0.0, 0.0)],     # (0, 0) = 그림자 제거 안 함
 }
 
 

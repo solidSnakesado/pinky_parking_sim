@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
-"""Closed-loop parking in the sim (kinematic): the robot parks using ONLY the ceiling-camera recognition.
+"""시뮬 폐루프 주차 (운동학): 로봇이 천장 카메라 인식만으로 주차한다.
 
-Each trial
-  1. the robot is put at a random position and heading in the entrance corridor (only where it can turn
-     in place without touching tape); a slot (A-D) and a mode (front / rear) are chosen (or given)
-  2. every 0.1 s: ceiling image rendered (calibrated camera, lens distortion, lighting / noise as the
-     dataset) -> recognition (pa / pb / ps) -> filter (wheel odometry predicts, camera corrects;
-     front/back kept by odometry after the start) -> controller acts on the ESTIMATED pose only
-  3. route through waypoints that keep tape clear:
-       entrance corridor -> entrance centre (u 346 mm) -> up through the entrance gap
-       -> staging point in front of the slot -> turn to the slot axis -> slot centre line in
-       (forward = front-in, backward = rear-in) -> stop
-  4. scoring uses the ground-truth pose: tape contact (robot footprint vs tape, every 10 ms),
-     final lateral / depth / heading error, front/back, time.
-The robot moves kinematically (pose set directly, wheel speed noise + odometry error as in
-gen_drive_sequences.py); no contact physics, so contact is detected, not felt.
+시행 1회
+  1. 입구 통로의 무작위 위치·방향에 로봇을 놓는다(제자리 회전해도 테이프에 닿지 않는 곳만).
+     칸(A~D)과 방식(전면 / 후면)을 고른다(또는 옵션으로 지정).
+  2. 0.1초마다: 천장 이미지 렌더링(보정 카메라, 렌즈 왜곡, 데이터셋과 같은 조명 / 노이즈)
+     -> 인식(pa / pb / ps) -> 필터(바퀴 오도메트리가 예측하고 카메라가 보정, 출발 후에는 앞/뒤를
+     오도메트리로 유지) -> 제어기는 추정 자세만 보고 움직임
+  3. 테이프를 피하는 경유점을 따라 이동:
+       입구 통로 -> 입구 중심(u 346 mm) -> 입구 틈을 지나 위로
+       -> 칸 앞 대기점 -> 칸 축 방향으로 회전 -> 칸 중심선을 따라 진입
+       (전진 = 전면 주차, 후진 = 후면 주차) -> 정지
+  4. 판정은 정답 자세로 한다: 테이프 접촉(로봇 외곽 vs 테이프, 10 ms마다),
+     최종 좌우 / 깊이 / 방향 오차, 앞/뒤, 시간.
+로봇은 운동학적으로 움직인다(자세를 직접 설정, 바퀴 속도 노이즈 + 오도메트리 오차는
+gen_drive_sequences.py와 같음). 접촉 물리가 없으므로 접촉은 "느끼는" 것이 아니라 판정만 한다.
 
-usage:
-  python tools/park_closed_loop.py --method pa --trials 1 --viewer           # watch one trial
-  python tools/park_closed_loop.py --method pa --trials 20 --video 3         # 20 trials, mp4 of the first 3
+사용법:
+  python tools/park_closed_loop.py --method pa --trials 1 --viewer           # 1회 보기
+  python tools/park_closed_loop.py --method pa --trials 20 --video 3         # 20회, 앞 3회는 mp4 저장
   python tools/park_closed_loop.py --method ps --weights runs/segment/runs/ps/yolo11n_seed0/weights/best.pt
   python tools/park_closed_loop.py --slot B --mode rear --trials 1 --video 1
-output: results/park_<method>/trials.csv, trial_XXX.mp4 (ceiling camera with estimate / ground truth)
+출력: results/park_<method>/trials.csv, trial_XXX.mp4 (추정 / 정답을 표시한 천장 카메라 영상)
 """
 import argparse
 import csv
@@ -41,25 +41,25 @@ import gen_drive_sequences as S  # noqa: E402
 import parking_geom as G  # noqa: E402
 from eval_sequence import detector  # noqa: E402
 
-CTRL_DT = S.DT                     # 10 ms control / motion step
-FRAME_DT = 0.1                     # camera 10 Hz
+CTRL_DT = S.DT                     # 10 ms 제어 / 움직임 간격
+FRAME_DT = 0.1                     # 카메라 10 Hz
 V_MAX, V_SLOW, W_MAX = 0.10, 0.04, 1.2
-ENTRANCE_U = 346.0                 # centre of the entrance gap (tape ends at u 195 and 497)
+ENTRANCE_U = 346.0                 # 입구 틈의 중심 (테이프 끝이 u 195와 497)
 BELOW_GAP_V, ABOVE_GAP_V = 700.0, 480.0
 STAGING_V = 420.0
-PARK_V = {'front': 102.5, 'rear': 136.5}   # axle v that centres the body (118 mm long) in the slot (v 19..220)
+PARK_V = {'front': 102.5, 'rear': 136.5}   # 몸체(길이 118 mm)가 칸(v 19..220) 가운데 오게 하는 바퀴 축 v
 SETTLE_S, HOLD_S, TIME_LIMIT_S = 0.5, 1.0, 60.0
-# success limits (fixed before the first trial)
+# 성공 기준 (첫 시행 전에 고정)
 OK_LATERAL_MM, OK_DEPTH_MM, OK_YAW_DEG = 20.0, 20.0, 5.0
 
 
-# ---------------------------------------------------------------- geometry / contact (floor mm)
+# ---------------------------------------------------------------- 형상 / 접촉 (바닥 mm)
 def footprint(x, y, yaw):
-    """Robot footprint boxes (chassis + both wheels) as floor-mm polygons."""
+    """로봇 외곽 상자(몸통 + 양쪽 바퀴)를 바닥 mm 다각형으로."""
     R = G.rot(yaw)
     polys = []
     for x0, x1, y0, y1, z0, z1 in G.ROBOT_BOXES:
-        if z0 >= 0.1:            # lidar sits inside the chassis outline
+        if z0 >= 0.1:            # 라이다는 몸통 외곽 안쪽에 있음
             continue
         c = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]]) @ R.T + [x, y]
         polys.append(np.column_stack([D.START_U - c[:, 1] * 1000, D.START_V - c[:, 0] * 1000]))
@@ -67,7 +67,7 @@ def footprint(x, y, yaw):
 
 
 def overlaps(poly, rect):
-    """Separating-axis test: convex polygon (N,2) vs axis-aligned rectangle (u, v, w, h)."""
+    """분리축 검사: 볼록 다각형 (N,2) vs 축 정렬 사각형 (u, v, w, h)."""
     u, v, w, h = rect
     r = np.array([[u, v], [u + w, v], [u + w, v + h], [u, v + h]])
     for shape in (poly, r):
@@ -81,7 +81,7 @@ def overlaps(poly, rect):
 
 
 def touching(x, y, yaw):
-    """Names of the tapes the ground-truth footprint touches."""
+    """정답 자세의 로봇 외곽이 닿은 테이프 번호 목록."""
     hit = []
     for k, rect in enumerate(D.TAPES):
         if any(overlaps(p, rect) for p in footprint(x, y, yaw)):
@@ -90,7 +90,7 @@ def touching(x, y, yaw):
 
 
 def sample_start(rng):
-    """Random pose in the entrance corridor where an in-place turn touches no tape."""
+    """입구 통로의 무작위 자세 (제자리 회전해도 테이프에 닿지 않는 곳)."""
     for _ in range(1000):
         u, v, yaw = rng.uniform(300, 440), rng.uniform(690, 870), rng.uniform(-math.pi, math.pi)
         x, y = D.mm_to_world(u, v)[:2]
@@ -99,12 +99,12 @@ def sample_start(rng):
     raise RuntimeError('no free start pose')
 
 
-# ---------------------------------------------------------------- filter (online)
+# ---------------------------------------------------------------- 필터 (실시간)
 class Filter:
-    """Odometry predicts; camera corrects. Front/back is fixed at the start (majority of the first
-    measurements while standing still) and then kept by odometry; a camera pose pointing the other way
-    is turned around; a heading far from the prediction is ignored (position still used); a position
-    far from the prediction is skipped, and 30 such frames in a row (3 s: robot moved by hand) -> start again."""
+    """오도메트리가 예측하고 카메라가 보정한다. 앞/뒤는 출발 시(정지 상태의 첫 측정들의 다수결)
+    정하고 이후에는 오도메트리로 유지한다. 반대 방향을 가리키는 카메라 자세는 180° 돌려서 쓴다.
+    예측과 크게 다른 방향은 무시한다(위치는 사용). 예측에서 먼 위치는 건너뛰며, 이런 프레임이
+    30번 연속이면(3초: 사람이 로봇을 옮김) 처음부터 다시 시작한다."""
     GAIN_POS, GAIN_YAW, GATE_M, GATE_DEG, INIT_N, RESET_AFTER = 0.4, 0.3, 0.04, 30.0, 3, 30
 
     def __init__(self):
@@ -134,17 +134,17 @@ class Filter:
                 self.buf = []
             return
         m = list(meas)
-        if abs(G.wrap(m[2] - self.state[2])) > math.pi / 2:      # front/back from odometry, not the camera
+        if abs(G.wrap(m[2] - self.state[2])) > math.pi / 2:      # 앞/뒤는 카메라가 아니라 오도메트리 기준
             m[2] = G.wrap(m[2] + math.pi)
         far = math.hypot(m[0] - self.state[0], m[1] - self.state[1]) > self.GATE_M
-        if far:                                                   # position disagrees: outlier or moved by hand
+        if far:                                                   # 위치가 맞지 않음: 이상값 또는 사람이 옮김
             self.skips += 1
-            if self.skips >= self.RESET_AFTER:                    # 3 s of disagreement: start again
+            if self.skips >= self.RESET_AFTER:                    # 3초 동안 불일치: 다시 시작
                 self.state, self.skips = None, 0
             return
         self.skips = 0
         if abs(math.degrees(G.wrap(m[2] - self.state[2]))) > self.GATE_DEG:
-            m[2] = self.state[2]                                  # heading outlier: use the position only
+            m[2] = self.state[2]                                  # 방향 이상값: 위치만 사용
         self.state[0] += self.GAIN_POS * (m[0] - self.state[0])
         self.state[1] += self.GAIN_POS * (m[1] - self.state[1])
         self.state[2] = G.wrap(self.state[2] + self.GAIN_YAW * G.wrap(m[2] - self.state[2]))
@@ -156,9 +156,9 @@ def S_body_delta(a, b):
     return c * dx + s * dy, -s * dx + c * dy, G.wrap(b[2] - a[2])
 
 
-# ---------------------------------------------------------------- controller (acts on the estimate)
+# ---------------------------------------------------------------- 제어기 (추정 자세로 동작)
 def plan(slot, mode):
-    """Waypoint phases in world metres."""
+    """경유점 단계 목록 (월드 미터)."""
     w = lambda u, v: tuple(D.mm_to_world(u, v)[:2])
     su = D.SLOT_U[slot]
     final_yaw = 0.0 if mode == 'front' else math.pi
@@ -168,7 +168,7 @@ def plan(slot, mode):
             ('turn_to', w(su, STAGING_V)), ('go', (None, w(su, STAGING_V), +1)),
             ('turn', final_yaw),
             ('go', (w(su, STAGING_V), w(su, PARK_V[mode]), +1 if mode == 'front' else -1)),
-            ('turn', final_yaw),                       # last few degrees in place (safe inside the slot)
+            ('turn', final_yaw),                       # 마지막 몇 도는 제자리 회전 (칸 안에서 안전)
             ('hold', HOLD_S)]
 
 
@@ -181,14 +181,14 @@ class Controller:
         return self.phases[self.i][0] if self.i < len(self.phases) else 'done'
 
     def command(self, est):
-        """(v, w) from the estimated pose; advances phases."""
+        """추정 자세로 (v, w)를 계산하고, 단계를 넘김."""
         while self.i < len(self.phases):
             kind, arg = self.phases[self.i]
             if kind in ('settle', 'hold'):
                 if self.t >= arg and (kind == 'hold' or est is not None):
                     self._next(); continue
                 return 0.0, 0.0
-            if est is None:                                   # lost: stop and wait for the filter
+            if est is None:                                   # 위치를 잃음: 멈추고 필터를 기다림
                 return 0.0, 0.0
             x, y, yaw = est
             if kind in ('turn', 'turn_to'):
@@ -212,7 +212,7 @@ class Controller:
                 if remaining < 0.003:
                     self._next(); continue
                 motion = yaw if sign > 0 else G.wrap(yaw + math.pi)
-                want = math.atan2(d[1], d[0]) - math.atan(lateral / 0.04)    # steer back onto the line
+                want = math.atan2(d[1], d[0]) - math.atan(lateral / 0.04)    # 선 위로 돌아가도록 조향
                 w = float(np.clip(3.0 * G.wrap(want - motion), -W_MAX, W_MAX))
                 v = sign * float(np.clip(1.2 * remaining, 0.015, V_MAX if remaining > 0.06 else V_SLOW))
                 return v, w
@@ -225,14 +225,14 @@ class Controller:
         self.i, self.t, self.line = self.i + 1, 0.0, None
 
 
-# ---------------------------------------------------------------- rendering / video
+# ---------------------------------------------------------------- 렌더링 / 영상
 PANEL_W = 300
 METHOD_NAME = {'pa': 'P-A 규칙', 'pb': 'P-B 배경 차분', 'ps': 'P-S 세그멘테이션'}
 PHASE_NAME = {'settle': '초기 확인', 'turn_to': '회전', 'turn': '정렬 회전', 'go': '이동', 'hold': '주차 완료', 'done': '종료'}
 
 
 def find_korean_font():
-    """A font file that has Hangul (fontconfig first, then common paths); None -> English labels."""
+    """한글이 들어 있는 글꼴 파일 (fontconfig 먼저, 그다음 흔한 경로). None이면 영어 표시."""
     import subprocess
     try:
         out = subprocess.run(['fc-list', ':lang=ko', 'file'], capture_output=True, text=True, timeout=5).stdout
@@ -250,7 +250,7 @@ def find_korean_font():
 
 
 def target_errors(pose, slot, mode):
-    """(lateral mm, depth mm, heading deg) of a pose against the slot target; depth > 0 = not deep enough."""
+    """칸 목표 대비 자세의 (좌우 mm, 깊이 mm, 방향 deg). 깊이 > 0 = 덜 들어감."""
     tx, ty = D.mm_to_world(D.SLOT_U[slot], PARK_V[mode])[:2]
     final_yaw = 0.0 if mode == 'front' else math.pi
     return (abs(pose[1] - ty) * 1000, (tx - pose[0]) * 1000,
@@ -258,7 +258,7 @@ def target_errors(pose, slot, mode):
 
 
 class Overlay:
-    """Ceiling image with slot / arrows + a Korean side panel with live errors and the verdict."""
+    """칸 / 화살표를 그린 천장 이미지 + 실시간 오차와 판정을 보여 주는 한글 정보 패널."""
 
     def __init__(self, method):
         from PIL import ImageFont
@@ -381,7 +381,7 @@ def main():
     light0 = model.light_diffuse.copy()
     head0 = (model.vis.headlight.diffuse.copy(), model.vis.headlight.ambient.copy())
     renderer = mujoco.Renderer(model, rh, rw)
-    cam = G.Camera(D.CAM_POS, D.CAM_QUAT)                 # calibrated camera = what the estimate uses
+    cam = G.Camera(D.CAM_POS, D.CAM_QUAT)                 # 보정 카메라 = 추정에 쓰는 카메라
     viewer = None
     if args.viewer:
         from mujoco import viewer as mj_viewer
@@ -430,7 +430,7 @@ def main():
             if hit:
                 contact_steps += 1
                 touched.update(hit)
-            if t >= next_frame - 1e-9:                                   # camera frame
+            if t >= next_frame - 1e-9:                                   # 카메라 프레임
                 set_pose(robot, light, head)
                 rgb = ceiling()
                 rgb = (rgb - 128) * contrast + 128 + offset
@@ -465,11 +465,11 @@ def main():
         if writer is not None:
             writer.release()
 
-        # score with the ground truth
+        # 정답 자세로 판정
         su = D.SLOT_U[slot]
         tx, ty = D.mm_to_world(su, PARK_V[mode])[:2]
         final_yaw = 0.0 if mode == 'front' else math.pi
-        lateral = abs(robot.y - ty) * 1000              # slot axis runs along world x
+        lateral = abs(robot.y - ty) * 1000              # 칸 축은 월드 x 방향
         depth = abs(robot.x - tx) * 1000
         yaw_err = abs(math.degrees(G.wrap(robot.yaw - final_yaw)))
         done = ctrl.name == 'done'

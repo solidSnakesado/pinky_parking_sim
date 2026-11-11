@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Render the empty parking lot (no robot) for every image of a split, for P-B background subtraction.
+"""P-B 배경 차분용: 한 분할(split)의 모든 이미지에 대해 빈 주차장(로봇 없음)을 렌더링한다.
 
-Real use: the webcam is fixed, so an empty-lot background is captured once (average of many frames).
-Sim equivalent: for each dataset image, render the same scene with the same (jittered) camera pose
-from poses.csv, robot moved out of view, nominal lighting, no image noise (= averaged frames).
-Lighting / brightness of the dataset image therefore differs from the background, as it would in reality.
+실물에서는 웹캠이 고정되어 있으므로 빈 주차장 배경을 한 번 찍어 둔다(여러 프레임의 평균).
+시뮬에서는 이에 맞춰, 데이터셋 이미지마다 poses.csv의 같은(흔들림이 들어간) 카메라 자세로 같은 장면을
+렌더링하되 로봇은 화면 밖으로 옮기고, 조명은 기본값, 이미지 노이즈는 없음(= 여러 프레임 평균)으로 한다.
+따라서 데이터셋 이미지와 배경은 실물처럼 조명·밝기가 서로 다르다.
 
-usage (pinky_venv, needs mujoco):
+사용법 (pinky_venv, mujoco 필요):
   python tools/gen_background.py --split val
   python tools/gen_background.py --split test
-output: <data>/background/<split>/<name>.png
+출력: <data>/background/<split>/<name>.png
 """
 import argparse
 import csv
@@ -22,7 +22,7 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import gen_parking_dataset as D  # noqa: E402  (same scene build, camera and lens distortion as the dataset)
+import gen_parking_dataset as D  # noqa: E402  (데이터셋과 같은 장면 구성, 카메라, 렌즈 왜곡)
 
 
 def main():
@@ -46,7 +46,7 @@ def main():
     map_x, map_y = D.distortion_map(args.width, args.height, f, rw, rh)
     renderer = mujoco.Renderer(model, rh, rw)
     data.qpos[:] = model.qpos0
-    data.qpos[0:3] = [-5.0, -5.0, float(model.qpos0[2])]         # robot far outside the camera view
+    data.qpos[0:3] = [-5.0, -5.0, float(model.qpos0[2])]         # 로봇을 카메라 화면 밖 멀리 둠
 
     for i, r in enumerate(rows):
         model.cam_pos[cam_id] = [float(r['cam_x']), float(r['cam_y']), float(r['cam_z'])]

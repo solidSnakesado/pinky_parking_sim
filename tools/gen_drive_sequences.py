@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""Continuous parking drives in the sim, for the +F experiment (temporal filter / odometry fusion).
+"""+F 실험(시간 필터 / 오도메트리 융합)용으로 시뮬에서 연속 주차 주행을 만든다.
 
-Each run: the robot starts at a random pose in the entrance area, gets a random slot (A-D) and a
-random mode (front / rear), and drives a simple parking motion:
-  turn to the staging point in front of the slot -> drive there -> turn to the slot axis
-  -> drive into the slot (forward = front-in, backward = rear-in) -> hold.
-Frames are saved at 10 Hz (same as the ceiling camera node) with
-  - the ceiling camera image (same calibrated camera, lens distortion, colours as the dataset)
-  - ground-truth pose
-  - wheel odometry (integrated from wheel encoders with a per-run wheel radius / track error and
-    wheel speed noise, so odometry drifts like a real robot)
-The robot is moved kinematically (pose set directly, no contact physics): enough for recognition,
-and the motion stays exactly known.
+주행 1회: 로봇이 입구 구역의 무작위 자세에서 출발하고, 칸(A~D)과 방식(전면 / 후면)을 무작위로
+받아 단순한 주차 동작을 한다:
+  칸 앞 대기점 쪽으로 회전 -> 대기점까지 주행 -> 칸 축 방향으로 회전
+  -> 칸 안으로 주행 (전진 = 전면 주차, 후진 = 후면 주차) -> 정지 유지.
+프레임은 10 Hz(천장 카메라 노드와 같음)로 저장하며, 프레임마다 다음을 기록한다.
+  - 천장 카메라 이미지 (데이터셋과 같은 보정 카메라, 렌즈 왜곡, 색)
+  - 정답 자세
+  - 바퀴 오도메트리 (바퀴 엔코더로 적분. 주행마다 바퀴 반지름·바퀴 간격 오차와 바퀴 속도 노이즈를
+    넣어 실물처럼 오도메트리가 점점 틀어지게 함)
+로봇은 운동학적으로 움직인다(자세를 직접 설정, 접촉 물리 없음). 인식 평가에는 충분하고,
+움직임이 정확히 알려진 상태로 유지된다.
 
-usage (pinky_venv, needs mujoco):
-  python tools/gen_drive_sequences.py --runs 20             # background, fast
-  python tools/gen_drive_sequences.py --runs 1 --viewer     # watch one run in the MuJoCo viewer
-output: <out>/run_XXX/images/NNNNN.jpg, background.png, frames.csv ; <out>/runs.csv
-Each run uses its own random generator (seed, run index), so --runs 40 with the same seed
-contains the --runs 20 runs as its first 20.
+사용법 (pinky_venv, mujoco 필요):
+  python tools/gen_drive_sequences.py --runs 20             # 화면 없이 빠르게
+  python tools/gen_drive_sequences.py --runs 1 --viewer     # MuJoCo 뷰어로 주행 1회 보기
+출력: <out>/run_XXX/images/NNNNN.jpg, background.png, frames.csv ; <out>/runs.csv
+주행마다 별도의 난수 생성기(seed, 주행 번호)를 쓰므로, 같은 seed로 --runs 40을 하면
+앞의 20회는 --runs 20과 같다.
 """
 import argparse
 import math
@@ -34,12 +34,12 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gen_parking_dataset as D  # noqa: E402
 
-WHEEL_R = 0.028          # wheel radius (m)
-TRACK = 0.0812           # distance between the wheels (m)
-DT = 0.01                # motion integration step (s)
-FRAME_DT = 0.1           # camera frame period (10 Hz)
+WHEEL_R = 0.028          # 바퀴 반지름 (m)
+TRACK = 0.0812           # 두 바퀴 사이 거리 (m)
+DT = 0.01                # 움직임 적분 간격 (s)
+FRAME_DT = 0.1           # 카메라 프레임 주기 (10 Hz)
 V_MAX, W_MAX = 0.10, 1.2     # m/s, rad/s
-STAGING_V, PARKED_V = 420.0, 120.0     # floor v (mm) of the staging point and of the parked axle centre
+STAGING_V, PARKED_V = 420.0, 120.0     # 대기점과 주차 완료 시 바퀴 축 중심의 바닥 v (mm)
 HOLD_S, MAX_S = 1.0, 40.0
 
 
@@ -48,7 +48,7 @@ def wrap(a):
 
 
 def plan(rng):
-    """Start pose (x, y, yaw), slot index, mode and the list of motion phases."""
+    """출발 자세 (x, y, yaw), 칸 번호, 방식, 동작 단계 목록."""
     u, v = rng.uniform(250, 445), rng.uniform(560, 760)
     yaw = wrap(rng.choice([0.0, math.pi]) + rng.normal(0, math.radians(25)))
     x, y = D.mm_to_world(u, v)[:2]
@@ -56,35 +56,35 @@ def plan(rng):
     mode = str(rng.choice(['front', 'rear']))
     sx, sy = D.mm_to_world(D.SLOT_U[slot], STAGING_V)[:2]
     px, py = D.mm_to_world(D.SLOT_U[slot] + rng.normal(0, 3), PARKED_V)[:2]
-    final_yaw = 0.0 if mode == 'front' else math.pi          # yaw 0 = facing the slots
+    final_yaw = 0.0 if mode == 'front' else math.pi          # yaw 0 = 칸 쪽을 봄
     phases = [('turn_to', (sx, sy)), ('drive', (sx, sy, +1)), ('turn', final_yaw),
               ('drive', (px, py, +1 if mode == 'front' else -1)), ('hold', HOLD_S)]
     return (x, y, yaw), slot, mode, phases
 
 
 class Robot:
-    """Differential drive moved by wheel speeds; true pose and encoder odometry kept separately."""
+    """바퀴 속도로 움직이는 차동 구동 로봇. 실제 자세와 엔코더 오도메트리를 따로 관리."""
 
     def __init__(self, pose, rng):
         self.x, self.y, self.yaw = pose
-        self.ox, self.oy, self.oyaw = pose               # odometry starts at the true pose
-        self.r_err = 1 + rng.normal(0, 0.02)             # wheel radius error used by odometry
-        self.l_err = 1 + rng.normal(0, 0.03)             # track error used by odometry
-        self.noise = 0.03                                # wheel speed noise (slip, motor)
+        self.ox, self.oy, self.oyaw = pose               # 오도메트리는 실제 자세에서 시작
+        self.r_err = 1 + rng.normal(0, 0.02)             # 오도메트리가 쓰는 바퀴 반지름 오차
+        self.l_err = 1 + rng.normal(0, 0.03)             # 오도메트리가 쓰는 바퀴 간격 오차
+        self.noise = 0.03                                # 바퀴 속도 노이즈 (미끄러짐, 모터)
         self.rng = rng
-        self.wl = self.wr = 0.0                          # wheel angles (for the rendered wheels)
+        self.wl = self.wr = 0.0                          # 바퀴 회전각 (렌더링되는 바퀴용)
 
     def step(self, v, w):
         wl = (v - w * TRACK / 2) / WHEEL_R * (1 + self.rng.normal(0, self.noise))
         wr = (v + w * TRACK / 2) / WHEEL_R * (1 + self.rng.normal(0, self.noise))
         self.wl += wl * DT
         self.wr += wr * DT
-        # true motion
+        # 실제 움직임
         vt, wt = WHEEL_R * (wl + wr) / 2, WHEEL_R * (wr - wl) / TRACK
         self.x += vt * math.cos(self.yaw + wt * DT / 2) * DT
         self.y += vt * math.sin(self.yaw + wt * DT / 2) * DT
         self.yaw = wrap(self.yaw + wt * DT)
-        # odometry from the same encoder readings, with the wrong radius / track
+        # 같은 엔코더 값으로 계산한 오도메트리 (틀린 반지름 / 간격 사용)
         r, l = WHEEL_R * self.r_err, TRACK * self.l_err
         vo, wo = r * (wl + wr) / 2, r * (wr - wl) / l
         self.ox += vo * math.cos(self.oyaw + wo * DT / 2) * DT
@@ -93,7 +93,7 @@ class Robot:
 
 
 def command(robot, phase, t_phase):
-    """(v, w, done) for the current phase, using the true pose (the motion itself, not the experiment)."""
+    """현재 단계의 (v, w, 완료 여부). 실제 자세를 씀 (실험 대상이 아니라 움직임을 만드는 부분)."""
     kind, arg = phase
     if kind in ('turn', 'turn_to'):
         target = arg if kind == 'turn' else math.atan2(arg[1] - robot.y, arg[0] - robot.x)
@@ -107,7 +107,7 @@ def command(robot, phase, t_phase):
         err = wrap(heading - robot.yaw)
         v = sign * min(V_MAX, 1.5 * dist + 0.02)
         return v, float(np.clip(4.0 * err, -W_MAX, W_MAX)) if dist > 0.02 else 0.0, dist < 0.004
-    return 0.0, 0.0, t_phase >= arg                                   # hold
+    return 0.0, 0.0, t_phase >= arg                                   # 정지 유지
 
 
 def main():
@@ -170,7 +170,7 @@ def main():
 
         run_dir = out / f'run_{k:03d}'
         (run_dir / 'images').mkdir(parents=True, exist_ok=True)
-        # empty-lot background for P-B: same camera, nominal lighting, no noise
+        # P-B용 빈 주차장 배경: 같은 카메라, 기본 조명, 노이즈 없음
         bg = render(None, 1.0, head0)
         Image.fromarray(np.clip(bg, 0, 255).astype(np.uint8)).save(run_dir / 'background.png')
 

@@ -1,19 +1,19 @@
-"""P-A: rule-based robot detection on the ceiling image (baseline, no learning).
+"""P-A: 천장 영상에서 색 규칙으로 로봇을 검출한다(기준선, 학습 없음).
 
-wheels : blue pixels (HSV range), split into connected blobs, the two largest kept
-body   : dark pixels that are not tape (known tape map projected with the calibrated camera),
-         the dark blob closest to the wheels kept
-The pose itself is computed by parking_geom.pose_from_masks (shared with the learned methods).
+바퀴 : 파란색 픽셀(HSV 범위)을 연결된 덩어리로 나누고 가장 큰 두 개를 씀
+몸통 : 테이프가 아닌 어두운 픽셀(알고 있는 테이프 지도를 보정된 카메라로 투영해 제외)
+       중에서 바퀴에 가장 가까운 어두운 덩어리를 씀
+자세 계산은 parking_geom.pose_from_masks가 한다(학습 방법들과 공통).
 """
 import cv2
 import numpy as np
 
 import parking_geom as G
 
-# thresholds (OpenCV HSV: H 0-180); tuned on the val split only
+# 임계값 (OpenCV HSV: H 0-180), val 분할로만 튜닝함
 BLUE_LO, BLUE_HI = (95, 90, 50), (125, 255, 255)
 DARK_V_MAX = 70
-GRAY_V = (70, 215)       # grey parts on the robot top (screen board, rear bar): low saturation, mid value
+GRAY_V = (70, 215)       # 로봇 윗면의 회색 부품(화면 보드, 뒤쪽 바): 채도 낮음, 밝기 중간
 GRAY_S_MAX = 45
 TAPE_DILATE_PX = 4
 MIN_BLOB_PX = 15
@@ -27,7 +27,7 @@ def tape_mask(camera):
 
 
 def detect(image_bgr, camera):
-    """Returns (wheel_masks, body_mask) as boolean images."""
+    """(바퀴 마스크 목록, 몸통 마스크)를 bool 이미지로 반환."""
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     blue = cv2.inRange(hsv, BLUE_LO, BLUE_HI)
     blue = cv2.morphologyEx(blue, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
@@ -48,7 +48,7 @@ def detect(image_bgr, camera):
         best = None
         for i in range(1, n):
             area = st[i, cv2.CC_STAT_AREA]
-            if area < 150 or area > 12000:          # too small, or a wall
+            if area < 150 or area > 12000:          # 너무 작거나 벽임
                 continue
             d = np.linalg.norm(cen[i] - ref) if ref is not None else -area
             if best is None or d < best[0]:
@@ -56,7 +56,7 @@ def detect(image_bgr, camera):
         if best is not None:
             body = lab == best[1]
     if body is not None:
-        # add grey robot parts (screen board, rear bar) touching the dark body, within its neighbourhood
+        # 어두운 몸통에 맞닿은 회색 로봇 부품(화면 보드, 뒤쪽 바)을 주변 범위 안에서 몸통에 더함
         v, sat = hsv[:, :, 2], hsv[:, :, 1]
         grey = (v >= GRAY_V[0]) & (v <= GRAY_V[1]) & (sat <= GRAY_S_MAX)
         near = cv2.dilate(body.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0

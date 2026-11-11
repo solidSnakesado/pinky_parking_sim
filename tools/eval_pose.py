@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Evaluate a recognition method (robot pose from the ceiling image) against poses.csv ground truth.
+"""인식 방법(천장 영상 → 로봇 자세)을 poses.csv의 정답과 비교해 평가한다.
 
-usage:
+사용법:
   python tools/eval_pose.py --method pa --split val
   python tools/eval_pose.py --method pa --split test --out results/pa_test.csv
-  python tools/eval_pose.py --method pb --split val     (after tools/gen_background.py --split val)
+  python tools/eval_pose.py --method pb --split val     (tools/gen_background.py --split val 실행 후)
   python tools/eval_pose.py --method ps --weights runs/segment/runs/ps/yolo11n_seed0/weights/best.pt --split val
 
-Every method returns wheel masks + a body mask; the pose is computed by the shared
-parking_geom.pose_from_masks, so methods differ only in how the masks are found.
-Each image is evaluated with its own (calibrated) camera pose from poses.csv.
+모든 방법은 바퀴 마스크 + 몸통 마스크를 내고, 자세는 공통 함수 parking_geom.pose_from_masks가
+계산한다. 따라서 방법 간 차이는 마스크를 찾는 방식뿐이다.
+이미지마다 poses.csv에 기록된 그 이미지의 (보정된) 카메라 자세로 평가한다.
 """
 import argparse
 import csv
@@ -37,7 +37,7 @@ def load_rows(data, split):
 
 
 def get_method(name, data, split, weights=None):
-    """Returns detect(image, camera, row) -> (wheel_masks, body_mask)."""
+    """detect(image, camera, row) -> (바퀴 마스크 목록, 몸통 마스크) 함수를 반환."""
     if name == 'pa':
         import pa_rule
         return lambda img, cam, row: pa_rule.detect(img, cam)
@@ -52,7 +52,7 @@ def get_method(name, data, split, weights=None):
         bg_dir = data / 'background' / split
         if not bg_dir.is_dir():
             raise SystemExit(f'no backgrounds in {bg_dir}: run tools/gen_background.py --split {split}')
-        # backgrounds are loaded before timing (a real node keeps its one background in memory)
+        # 배경은 시간 측정 전에 불러 둠(실제 노드도 배경 하나를 메모리에 들고 있음)
         bgs = {p.stem: cv2.imread(str(p)) for p in bg_dir.glob('*.png')}
         def detect(img, cam, row):
             return pb_bgsub.detect(img, cam, bgs[row['name']])
@@ -118,9 +118,9 @@ def main():
                 p = cam.project(np.array([[x, y, 0.03], [x + 0.08 * math.cos(yaw), y + 0.08 * math.sin(yaw), 0.03]]))
                 cv2.arrowedLine(vis, tuple(np.round(p[0]).astype(int)), tuple(np.round(p[1]).astype(int)), color, 2,
                                 tipLength=0.3)
-            arrow(r['x_m'], r['y_m'], r['yaw_rad'], (0, 200, 0))          # ground truth: green
+            arrow(r['x_m'], r['y_m'], r['yaw_rad'], (0, 200, 0))          # 정답: 초록
             if pose is not None:
-                arrow(pose[0], pose[1], pose[2], (0, 0, 255))              # estimate: red
+                arrow(pose[0], pose[1], pose[2], (0, 0, 255))              # 추정: 빨강
             cv2.imwrite(str(dbg / f"{r['name']}.jpg"), vis)
     keys = ['name', 'kind', 'found', 'n_wheels', 'used_wheels', 'gt_x', 'gt_y', 'gt_yaw', 'est_x', 'est_y',
             'est_yaw', 'pos_err_mm', 'yaw_err_deg']

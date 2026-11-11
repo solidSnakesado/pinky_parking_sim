@@ -1,8 +1,8 @@
-"""Ceiling (overhead) camera for the MuJoCo Pinky sim.
+"""MuJoCo 핑키 시뮬용 천장(위에서 내려다보는) 카메라.
 
-pinky_pro is not modified: this node loads the scene the sim generated
-(~/.cache/pinky_mujoco/scene.xml), adds a fixed world camera, mirrors the robot
-pose (/ground_truth) and wheel joints (/joint_states), and publishes the render.
+pinky_pro는 수정하지 않는다: 이 노드는 시뮬이 만든 장면(~/.cache/pinky_mujoco/scene.xml)을
+불러와 월드에 고정 카메라를 추가하고, 로봇 자세(/ground_truth)와 바퀴 관절(/joint_states)을
+그대로 따라 맞춘 뒤 렌더링 결과를 발행한다.
 """
 import math
 import os
@@ -14,10 +14,10 @@ from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image, JointState
 
-# Matte colours sampled from a top-down photo of the real Pinky (render-only, physics unchanged).
+# 실물 핑키를 위에서 찍은 사진에서 뽑은 무광 색 (렌더링 전용, 물리는 바뀌지 않음).
 REAL_COLORS = {'wheel': (0.05, 0.42, 0.72), 'body': (0.06, 0.06, 0.07), 'lidar': (0.04, 0.04, 0.05),
                'rear': (0.62, 0.62, 0.66), 'front': (0.45, 0.45, 0.45)}
-# First matching geom-name prefix wins.
+# geom 이름 접두어가 처음 일치하는 규칙을 씀.
 COLOR_RULES = [('l_wheel_visual_0_4', 'wheel'), ('r_wheel_visual_0_4', 'wheel'),
                ('l_wheel_visual', 'body'), ('r_wheel_visual', 'body'),
                ('robot_lamp_visual', 'rear'), ('screen_mount_visual', 'front'),
@@ -51,11 +51,11 @@ class CeilingCamera(Node):
         fps = float(p('fps', 10.0).value)
         self.frame_id = p('frame_id', 'ceiling_camera').value
         real_colors = bool(p('real_colors', True).value)
-        # radial lens distortion of the real webcam (calibrated, OpenCV k1); 0 disables it
+        # 실물 웹캠의 방사 렌즈 왜곡 (보정값, OpenCV k1). 0이면 왜곡 없음
         self.k1 = float(p('distortion_k1', -0.2184).value)
-        self.f = self.width / 2 / math.tan(hfov / 2)          # focal length in pixels
-        # render an undistorted image slightly larger than the output so that the
-        # barrel-distorted output has source pixels up to its corners
+        self.f = self.width / 2 / math.tan(hfov / 2)          # 픽셀 단위 초점 거리
+        # 왜곡 전 이미지를 출력보다 조금 크게 렌더링해서,
+        # 배럴 왜곡을 적용한 출력의 모서리까지 원본 픽셀이 있게 함
         margin = 1.0
         if self.k1 < 0:
             rd = math.hypot(self.width / 2, self.height / 2) / self.f
@@ -96,18 +96,18 @@ class CeilingCamera(Node):
                                f'pos={pos}, hfov={math.degrees(hfov):g} deg, k1={self.k1:g}, real_colors={real_colors}')
 
     def distortion_map(self):
-        """For every output (distorted) pixel, the source pixel in the undistorted render."""
+        """출력(왜곡) 픽셀마다 대응하는 왜곡 전 렌더링의 원본 픽셀 위치."""
         ys, xs = np.mgrid[0:self.height, 0:self.width].astype(np.float64)
         xd = (xs - self.width / 2) / self.f
         yd = (ys - self.height / 2) / self.f
         xu, yu = xd.copy(), yd.copy()
-        for _ in range(20):                      # invert x_d = x_u * (1 + k1 * r_u^2)
+        for _ in range(20):                      # x_d = x_u * (1 + k1 * r_u^2)의 역계산
             scale = 1 + self.k1 * (xu * xu + yu * yu)
             xu, yu = xd / scale, yd / scale
         return xu * self.f + self.rw / 2, yu * self.f + self.rh / 2
 
     def distort(self, rgb):
-        """Bilinear resample of the undistorted render into the distorted output image."""
+        """왜곡 전 렌더링을 쌍선형 보간으로 다시 샘플링해 왜곡된 출력 이미지를 만듦."""
         x = np.clip(self.map_x, 0, self.rw - 1.001)
         y = np.clip(self.map_y, 0, self.rh - 1.001)
         x0, y0 = x.astype(np.int32), y.astype(np.int32)

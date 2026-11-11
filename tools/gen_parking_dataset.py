@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Generate a YOLO-seg dataset of the ceiling camera view of the parking board (MuJoCo, no ROS).
+"""주차판을 내려다보는 천장 카메라 시점의 YOLO-seg 데이터셋을 만든다 (MuJoCo, ROS 불필요).
 
-Classes: 0 wheel, 1 line (black tape), 2 body (robot body, wheels excluded).
-Robot poses are sampled in the parking board (random, approaching, parked front-in / rear-in),
-with camera, light and image randomisation. The camera is the calibrated real webcam
-(NOVOMAX NC-150, 640x480) including its radial lens distortion. pinky_pro is not modified.
-A poses.csv with the ground-truth robot pose and the actual camera pose of every image is written next to data.yaml.
+클래스: 0 바퀴, 1 라인(검은 테이프), 2 몸통(로봇 몸체, 바퀴 제외).
+로봇 자세는 주차판 안에서 뽑는다(무작위, 접근 중, 전면 주차 / 후면 주차 완료).
+카메라·조명·이미지를 무작위로 바꾼다. 카메라는 보정한 실물 웹캠(NOVOMAX NC-150, 640x480)이며
+방사 렌즈 왜곡까지 넣는다. pinky_pro는 수정하지 않는다.
+이미지마다 로봇 정답 자세와 실제(흔들림이 들어간) 카메라 자세를 poses.csv로 data.yaml 옆에 저장한다.
 
-usage:
-  train+val : python gen_parking_dataset.py --count 2000                      (val = --val fraction, seed 0)
-  test only : python gen_parking_dataset.py --count 300 --split test --seed 100
-Use a different --seed for each separately generated split so no pose/lighting sample is shared.
+사용법:
+  train+val : python gen_parking_dataset.py --count 2000                      (val = --val 비율, seed 0)
+  test만    : python gen_parking_dataset.py --count 300 --split test --seed 100
+따로 만드는 분할마다 다른 --seed를 써서, 자세·조명 샘플이 겹치지 않게 한다.
 """
 import argparse
 import math
@@ -24,14 +24,14 @@ from scipy.spatial import ConvexHull
 
 CLASSES = ['wheel', 'line', 'body']
 
-# Ceiling camera: calibrated real webcam (same values as the parking_ceiling_camera node).
+# 천장 카메라: 보정한 실물 웹캠 (parking_ceiling_camera 노드와 같은 값).
 CAM_POS = np.array([-0.2894, 0.5706, 1.815])
 CAM_QUAT = np.array([0.69746, 0.15253, -0.16265, -0.68105])
 HFOV_DEG = 37.21
 K1 = -0.2184
 
-# Black tape rectangles in floor mm (u from left, v from top, w, h); floor 1350 x 1200,
-# see worlds/course_floor.png and docs course_tape_positions.md.
+# 검은 테이프 사각형, 바닥 mm 좌표 (u 왼쪽부터, v 위쪽부터, 폭 w, 높이 h). 바닥 1350 x 1200,
+# worlds/course_floor.png와 문서 course_tape_positions.md 참고.
 TAPES = [
     (0, 0, 900, 19), (0, 0, 19, 600), (881, 0, 19, 600),
     (22.5, 0, 19, 220), (231.5, 0, 19, 220), (440.5, 0, 19, 220), (649.5, 0, 19, 220), (858.5, 0, 19, 220),
@@ -40,8 +40,8 @@ TAPES = [
     (957, 100, 19, 580), (957, 100, 337, 19), (1275, 100, 19, 1100), (957, 981, 19, 219), (957, 1181, 337, 19),
 ]
 FLOOR_Z = 0.002
-START_U, START_V = 1125.0, 1090.0                                     # sim origin (robot start) in floor mm
-SLOT_U = (136.5, 345.5, 554.5, 763.5)                                 # A..D slot centres (floor u)
+START_U, START_V = 1125.0, 1090.0                                     # 시뮬 원점(로봇 출발점)의 바닥 mm 좌표
+SLOT_U = (136.5, 345.5, 554.5, 763.5)                                 # A~D 칸 중심 (바닥 u)
 
 REAL_COLORS = {'wheel': (0.05, 0.42, 0.72), 'body': (0.06, 0.06, 0.07), 'lidar': (0.04, 0.04, 0.05),
                'rear': (0.62, 0.62, 0.66), 'front': (0.45, 0.45, 0.45)}
@@ -79,12 +79,12 @@ def small_rotation(rng, max_deg):
 
 
 def render_size(width, height, f):
-    """Undistorted render a bit larger than the output so barrel distortion has source pixels."""
+    """왜곡 전 렌더링을 출력보다 조금 크게 잡아, 배럴 왜곡을 적용할 때 원본 픽셀이 모자라지 않게 함."""
     rd = math.hypot(width / 2, height / 2) / f
     ru = rd
     for _ in range(20):
         ru = rd / (1 + K1 * ru * ru)
-    margin = max(1.0, ru / rd) * 1.08          # extra room for camera jitter is not needed; 8% safety
+    margin = max(1.0, ru / rd) * 1.08          # 카메라 흔들림용 여유는 필요 없음. 8% 안전 여유
     return int(math.ceil(width * margin / 2)) * 2, int(math.ceil(height * margin / 2)) * 2
 
 
@@ -136,32 +136,32 @@ def build(model_path, width, height):
 
 
 def geom_classes(model):
-    """geom id -> (class id, instance key) for robot visual geoms."""
+    """로봇 시각 geom의 geom id -> (클래스 id, 인스턴스 키)."""
     table = {}
     for i in range(model.ngeom):
         if model.geom_group[i] != 2 or model.geom_bodyid[i] == 0:
             continue
         name = model.geom(i).name
         if name.startswith(('l_wheel_visual', 'r_wheel_visual')):
-            table[i] = (0, name[0])          # whole wheel, 'l' / 'r' instance
+            table[i] = (0, name[0])          # 바퀴 전체, 'l' / 'r' 인스턴스
         else:
             table[i] = (2, 'body')
     return table
 
 
 def sample_pose(rng):
-    """Robot centre (floor mm u, v) and heading; yaw 0 = facing the slots (-v), i.e. front-in."""
+    """로봇 중심(바닥 mm u, v)과 방향. yaw 0 = 칸 쪽(-v)을 봄, 즉 전면 주차 방향."""
     kind = rng.choice(['free', 'entrance', 'approach', 'parked'], p=[0.35, 0.15, 0.20, 0.30])
-    if kind == 'free':                       # anywhere on the parking board, any heading
+    if kind == 'free':                       # 주차판 어디든, 방향 무작위
         u, v, yaw = rng.uniform(60, 840), rng.uniform(60, 560), rng.uniform(-math.pi, math.pi)
-    elif kind == 'entrance':                 # in the entrance / lower corridor, heading roughly up or down
+    elif kind == 'entrance':                 # 입구 / 아래쪽 통로, 대략 위 또는 아래 방향
         u, v = rng.uniform(250, 445), rng.uniform(560, 760)
         yaw = rng.choice([0.0, math.pi]) + rng.normal(0, math.radians(25))
-    elif kind == 'approach':                 # between entrance and slots, roughly facing a slot
+    elif kind == 'approach':                 # 입구와 칸 사이, 대략 칸을 향함
         u = rng.choice(SLOT_U) + rng.normal(0, 80)
         v = rng.uniform(250, 500)
         yaw = rng.choice([0.0, math.pi]) + rng.normal(0, math.radians(35))
-    else:                                    # parked front-in (yaw 0) or rear-in (yaw pi), small errors
+    else:                                    # 전면 주차(yaw 0) 또는 후면 주차(yaw π) 완료, 작은 오차 포함
         u = rng.choice(SLOT_U) + rng.normal(0, 15)
         v = rng.uniform(90, 150)
         yaw = rng.choice([0.0, math.pi]) + rng.normal(0, math.radians(6))
@@ -170,9 +170,9 @@ def sample_pose(rng):
 
 
 def project(points, data, cam_id, f, width, height):
-    """World points -> distorted output pixels (same model as the real webcam)."""
+    """월드 점 -> 왜곡된 출력 픽셀 (실물 웹캠과 같은 모델)."""
     pos, rot = data.cam_xpos[cam_id], data.cam_xmat[cam_id].reshape(3, 3)
-    local = (points - pos) @ rot              # world -> camera frame (camera looks along -Z, +Y up)
+    local = (points - pos) @ rot              # 월드 -> 카메라 좌표 (카메라는 -Z 방향을 봄, +Y가 위)
     xu = local[:, 0] / -local[:, 2]
     yu = -local[:, 1] / -local[:, 2]
     scale = 1 + K1 * (xu * xu + yu * yu)
@@ -180,7 +180,7 @@ def project(points, data, cam_id, f, width, height):
 
 
 def tape_outline(u, v, w, h, step=10.0):
-    """Rectangle perimeter sampled every `step` mm so its curved (distorted) image is followed."""
+    """사각형 둘레를 `step` mm마다 샘플링 (왜곡으로 휘어진 이미지 모양을 따라가기 위함)."""
     pts = []
     for (u0, v0), (u1, v1) in (((u, v), (u + w, v)), ((u + w, v), (u + w, v + h)),
                                ((u + w, v + h), (u, v + h)), ((u, v + h), (u, v))):
@@ -191,7 +191,7 @@ def tape_outline(u, v, w, h, step=10.0):
 
 
 def clip_polygon(poly, width, height):
-    """Sutherland-Hodgman clip of a polygon to the image rectangle."""
+    """다각형을 이미지 사각형으로 자름 (Sutherland-Hodgman 방식)."""
     def clip(points, inside, cross):
         out = []
         for i in range(len(points)):
@@ -224,7 +224,7 @@ def mask_polygon(mask):
     if len(xs) < 20:
         return []
     pts = np.column_stack([xs, ys]).astype(float)
-    pts = np.vstack([pts, pts + [1, 0], pts + [0, 1], pts + [1, 1]])   # pixel corners
+    pts = np.vstack([pts, pts + [1, 0], pts + [0, 1], pts + [1, 1]])   # 픽셀 모서리
     try:
         hull = ConvexHull(pts)
     except Exception:
@@ -288,7 +288,7 @@ def main():
         data.qpos[0:3] = [x, y, base_z]
         data.qpos[3:7] = yaw_quat(yaw)
         data.qpos[wheel_q] = rng.uniform(-math.pi, math.pi, 2)
-        # camera jitter (mount moved slightly / re-mounted): default +-3 cm, +-3 deg
+        # 카메라 흔들림 (거치대가 조금 움직이거나 다시 설치됨): 기본 ±3 cm, ±3°
         cam_d = rng.uniform(-args.cam_jitter_m, args.cam_jitter_m, 3)
         model.cam_pos[cam_id] = CAM_POS + cam_d
         model.cam_quat[cam_id] = quat_mul(CAM_QUAT, small_rotation(rng, args.cam_jitter_deg))
@@ -300,10 +300,10 @@ def main():
         mujoco.mj_camlight(model, data)
 
         rgb_renderer.update_scene(data, camera='ceiling_camera')
-        rgb = remap_bilinear(rgb_renderer.render(), map_x, map_y)          # lens distortion
+        rgb = remap_bilinear(rgb_renderer.render(), map_x, map_y)          # 렌즈 왜곡
         seg_renderer.update_scene(data, camera='ceiling_camera')
         seg = remap_nearest(seg_renderer.render(), map_x, map_y)
-        # image randomisation: brightness/contrast, colour cast, sensor noise
+        # 이미지 무작위화: 밝기/대비, 색 틀어짐, 센서 노이즈
         rgb = (rgb - 128) * rng.uniform(0.85, 1.15) + 128 + rng.uniform(-20, 20)
         rgb *= rng.uniform(0.97, 1.03, 3)
         rgb += rng.normal(0, rng.uniform(1, 5), rgb.shape)
@@ -331,7 +331,7 @@ def main():
 
         name = f'{k:05d}_{kind}'
         u_mm, v_mm = world_to_mm(x, y)
-        cp, cq = model.cam_pos[cam_id], model.cam_quat[cam_id]     # actual (jittered) camera pose, world frame
+        cp, cq = model.cam_pos[cam_id], model.cam_quat[cam_id]     # 실제(흔들림이 들어간) 카메라 자세, 월드 좌표
         csv.write(f'{split},{name},{kind},{x:.4f},{y:.4f},{yaw:.4f},{u_mm:.1f},{v_mm:.1f},'
                   f'{cp[0]:.5f},{cp[1]:.5f},{cp[2]:.5f},{cq[0]:.6f},{cq[1]:.6f},{cq[2]:.6f},{cq[3]:.6f},{scale:.3f}\n')
         image.save(out / 'images' / split / f'{name}.jpg', quality=95)
