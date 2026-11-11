@@ -11,7 +11,8 @@
   1. 출발 구역의 무작위 자세에 로봇을 놓고, 칸(A~D)과 방식(전면 / 후면)을 고른다.
      출발 구역: 'corridor' = 입구 통로 (park_closed_loop.py와 같음, 평가에 사용),
                 'lane' = 칸 앞 통로 어디든 (학습 전용: 마지막 동작을 연습).
-     학습 때는 두 구역을 섞는다 (lane_start_prob, 기본 0.5)
+                'slot' = 칸 앞 대기점~칸 입구 사이, 목표 방향에 가까운 자세 (학습 전용: 진입·정지 연습).
+     학습 때는 세 구역을 섞는다 (lane_start_prob, slot_start_prob, 나머지는 corridor)
   2. 0.1초(10 Hz)마다 정책이 (직진, 회전) 속도를 내고, 물리를 10 ms씩 10번 진행한다
   3. 성공, 테이프 접촉, 바닥 판 이탈, 시간 초과 중 하나가 되면 판이 끝난다
 
@@ -76,6 +77,9 @@ SLOT_AXIS_K = 3.0                  # 칸 진입 항에서 칸 축에서 벗어�
 CORRIDOR_V = 590.0                 # v > 이 값: 입구 통로 (틈 아래쪽), 그 외: 칸 앞 통로
 # 출발 구역 (바닥 mm): corridor = park_closed_loop.py와 같음, lane = 칸 앞 통로 어디든
 START_AREAS = {'corridor': ((300, 440), (690, 870)), 'lane': ((60, 840), (260, 540))}
+# 'slot' 출발 구역: 칸 축에서 좌우 ±SLOT_START_U mm, 바퀴 축 v는 (목표 v + 40) ~ 대기점 v,
+# 방향은 목표 방향 ±SLOT_START_DEG° (전면 = 칸을 향함, 후면 = 칸을 등짐). 테이프에 닿는 자세는 다시 뽑음
+SLOT_START_U, SLOT_START_V_MARGIN, SLOT_START_DEG = 30.0, 40.0, 20.0
 R_SUCCESS, R_CONTACT, R_OUT = 20.0, -10.0, -10.0
 
 
@@ -138,9 +142,20 @@ def route_remaining(x, y, slot, mode):
     return mm / 1000.0
 
 
-def sample_start(rng, area='corridor'):
-    """출발 구역 안의 무작위 자세 (제자리 회전해도 테이프에 닿지 않는 곳).
-    corridor = 입구 통로 (park_closed_loop.py와 같음), lane = 칸 앞 통로."""
+def sample_start(rng, area='corridor', slot=0, mode='front'):
+    """출발 구역 안의 무작위 자세.
+    corridor = 입구 통로 (park_closed_loop.py와 같음), lane = 칸 앞 통로: 제자리 회전해도 테이프에 닿지 않는 곳.
+    slot = 목표 칸 앞 (대기점 ~ 칸 입구, 일부는 칸 안), 목표 방향에 가까운 자세: 그 자세로 테이프에 닿지 않는 곳."""
+    if area == 'slot':
+        tyaw = 0.0 if mode == 'front' else math.pi
+        for _ in range(1000):
+            u = D.SLOT_U[slot] + rng.uniform(-SLOT_START_U, SLOT_START_U)
+            v = rng.uniform(PARK_V[mode] + SLOT_START_V_MARGIN, STAGING_V)
+            yaw = G.wrap(tyaw + math.radians(rng.uniform(-SLOT_START_DEG, SLOT_START_DEG)))
+            x, y = G.mm_to_world(u, v)
+            if not touching(x, y, yaw):
+                return float(x), float(y), float(yaw)
+        raise RuntimeError('no free slot start pose')
     (u0, u1), (v0, v1) = START_AREAS[area]
     for _ in range(1000):
         u, v, yaw = rng.uniform(u0, u1), rng.uniform(v0, v1), rng.uniform(-math.pi, math.pi)
@@ -181,14 +196,15 @@ def load_ps_errors(path=REPO / 'results/ps_test.csv'):
 class ParkEnv(gym.Env):
     metadata = {'render_modes': []}
 
-    def __init__(self, noise='ps', slot=None, mode=None, scene=SCENE, contact_ends=True, lane_start_prob=0.5):
+    def __init__(self, noise='ps', slot=None, mode=None, scene=SCENE, contact_ends=True, lane_start_prob=0.5,
+                 slot_start_prob=0.0):
         from pinky_mujoco.model import Physics
         self.physics = Physics(scene)
         self.base_z = float(self.physics.model.qpos0[2])
         self.noise = noise
         self.errors = load_ps_errors() if noise == 'ps' else None
         self.fixed_slot, self.fixed_mode, self.contact_ends = slot, mode, contact_ends
-        self.lane_start_prob = lane_start_prob
+        self.lane_start_prob, self.slot_start_prob = lane_start_prob, slot_start_prob
         self.max_steps = int(round(TIME_LIMIT_S / CTRL_DT))
         self.action_space = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(17,), dtype=np.float32)
@@ -237,8 +253,12 @@ class ParkEnv(gym.Env):
         self.slot = options.get('slot', self.fixed_slot)
         self.slot = int(self.np_random.integers(4)) if self.slot is None else int(self.slot)
         self.mode = options.get('mode', self.fixed_mode) or ('front' if self.np_random.random() < 0.5 else 'rear')
-        area = options.get('area') or ('lane' if self.np_random.random() < self.lane_start_prob else 'corridor')
-        start = options.get('start') or sample_start(self.np_random, area)
+        area = options.get('area')
+        if area is None:
+            r = self.np_random.random()
+            area = ('slot' if r < self.slot_start_prob else
+                    'lane' if r < self.slot_start_prob + self.lane_start_prob else 'corridor')
+        start = options.get('start') or sample_start(self.np_random, area, self.slot, self.mode)
         self.target = target_pose(self.slot, self.mode)
         self.staging_to_target = abs(STAGING_V - PARK_V[self.mode]) / 1000.0
         self._set_pose(*start)
@@ -313,7 +333,7 @@ def main():
     rng = np.random.default_rng(0)
     results, steps, t0 = {}, 0, time.time()
     for k in range(args.episodes):
-        obs, info = env.reset(seed=k, options={'area': ('corridor', 'lane')[k % 2]})
+        obs, info = env.reset(seed=k, options={'area': ('corridor', 'lane', 'slot')[k % 3]})
         ret, done = 0.0, False
         while not done:
             obs, r, term, trunc, inf = env.step(rng.uniform(-1, 1, 2))
