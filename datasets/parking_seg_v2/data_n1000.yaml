@@ -1,0 +1,8 @@
+path: /home/sado/dev_ws/pinky_parking_sim/datasets/parking_seg_v2
+train: train_n1000.txt
+val: images/val
+test: images/test
+names:
+  0: wheel
+  1: line
+  2: body
