@@ -9,6 +9,7 @@
   - --learning-rate: 학습률 (이어서 학습할 때 낮추면 후반 성능 하락을 줄이는 데 도움)
   - --checkpoint-every 단계마다 모델과 정규화 통계를 checkpoints/에 저장 (긴 학습이 중간에 멈춰도 남음)
   - 평가 줄에 전면(F) / 후면(R) 성공률을 따로 표시
+  - --mode front|rear: 학습과 평가를 한 방식으로만 (단계별 실험용), --eval-area: 평가 출발 구역
   - --eval-every 단계마다: 학습에 쓰지 않은 "고정" 평가 판 목록(칸 A~D x 전면/후면, 고정 출발 자세,
     항상 입구 통로에서 출발)을 현재 정책으로 탐색 무작위성 없이 주행하고,
     성공 / 접촉 / 이탈 / 시간 초과 비율과 성공한 판의 최종 오차를 기록
@@ -49,9 +50,9 @@ REPO = Path(__file__).resolve().parents[1]
 EVAL_SEED0 = 100000                 # 평가 출발 자세는 이 시드부터 만듦 (학습은 다른 시드 사용)
 
 
-def make_env(rank, seed, noise, lane_start_prob, slot_start_prob, slot_rear_prob):
+def make_env(rank, seed, noise, lane_start_prob, slot_start_prob, slot_rear_prob, mode=None):
     def thunk():
-        env = ParkEnv(noise=noise, lane_start_prob=lane_start_prob, slot_start_prob=slot_start_prob,
+        env = ParkEnv(noise=noise, mode=mode, lane_start_prob=lane_start_prob, slot_start_prob=slot_start_prob,
                       slot_rear_prob=slot_rear_prob)
         env.reset(seed=seed * 1000 + rank)
         return env
@@ -67,14 +68,15 @@ def _final_state(env):
             'stopped': bool(abs(v) < STOP_V and abs(w) < STOP_W), 'final_v': float(v), 'final_w': float(w)}
 
 
-def evaluate(model, vecnorm, env, episodes, area='corridor'):
+def evaluate(model, vecnorm, env, episodes, area='corridor', mode=None):
     """고정 평가 판, 기본은 입구 통로에서 출발: k번 판 -> 칸 k % 4, 방식은 4판마다 전면/후면을 번갈아,
     출발 자세는 시드 EVAL_SEED0+k로 만듦. area로 출발 구역을 바꿀 수 있음 (진단용: lane / slot).
+    mode를 주면 모든 판을 그 방식(front / rear)으로 함.
     반환값: (요약, 판마다 최종 상태를 담은 행 목록)."""
     counts = {'success': 0, 'contact': 0, 'out': 0, 'timeout': 0}
     lat, dep, yaw, tim, rows = [], [], [], [], []
     for k in range(episodes):
-        obs, start = env.reset(seed=EVAL_SEED0 + k, options={'slot': k % 4, 'mode': ('front', 'rear')[(k // 4) % 2],
+        obs, start = env.reset(seed=EVAL_SEED0 + k, options={'slot': k % 4, 'mode': mode or ('front', 'rear')[(k // 4) % 2],
                                                                 'area': area})
         done, min_dist = False, float('inf')
         while not done:
@@ -133,9 +135,10 @@ def report(rows):
 
 
 class EvalCallback(BaseCallback):
-    def __init__(self, out, every, episodes, noise, checkpoint_every=0):
+    def __init__(self, out, every, episodes, noise, checkpoint_every=0, area='corridor', mode=None):
         super().__init__()
         self.out, self.every, self.episodes = out, every, episodes
+        self.area, self.mode = area, mode
         self.checkpoint_every = checkpoint_every
         self.env = ParkEnv(noise=noise)
         self.next, self.best, self.t0 = every, -1.0, time.time()
@@ -159,7 +162,7 @@ class EvalCallback(BaseCallback):
             return True
         self.next += self.every
         vecnorm = self.model.get_env()
-        r, _ = evaluate(self.model, vecnorm, self.env, self.episodes)
+        r, _ = evaluate(self.model, vecnorm, self.env, self.episodes, self.area, self.mode)
         row = {'steps': self.num_timesteps, 'minutes': round((time.time() - self.t0) / 60, 1), **r}
         if self.writer is None:
             self.writer = csv.DictWriter(self.csv, fieldnames=list(row))
@@ -212,9 +215,12 @@ def main():
                          'print every episode and write eval_<which>_episodes.csv')
     ap.add_argument('--which', choices=['best', 'last'], default='best', help='model for --eval-only')
     ap.add_argument('--eval-area', choices=['corridor', 'lane', 'slot'], default='corridor',
-                    help='--eval-only: start area of the evaluation episodes (diagnosis; training-time '
-                         'evaluation always uses corridor)')
+                    help='start area of the evaluation episodes (--eval-only and training-time evaluation; '
+                         'corridor = the standard evaluation, lane / slot = diagnosis or staged experiments)')
+    ap.add_argument('--mode', choices=['both', 'front', 'rear'], default='both',
+                    help='parking mode of the training and evaluation episodes (front / rear = one mode only)')
     args = ap.parse_args()
+    mode = None if args.mode == 'both' else args.mode
 
     out = REPO / 'runs/rl' / args.name
     if args.eval_only:
@@ -225,14 +231,14 @@ def main():
                                     DummyVecEnv([lambda: ParkEnv(noise=args.noise)]))
         vecnorm.training = False
         t0 = time.time()
-        summary, rows = evaluate(model, vecnorm, ParkEnv(noise=args.noise), args.eval_episodes, args.eval_area)
-        suffix = '' if args.eval_area == 'corridor' else f'_{args.eval_area}'
+        summary, rows = evaluate(model, vecnorm, ParkEnv(noise=args.noise), args.eval_episodes, args.eval_area, mode)
+        suffix = ('' if args.eval_area == 'corridor' else f'_{args.eval_area}') + (f'_{mode}' if mode else '')
         path = out / f'eval_{args.which}_episodes{suffix}.csv'
         with open(path, 'w', newline='') as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0]))
             w.writeheader()
             w.writerows(rows)
-        print(f'{args.name} / {args.which}_model, noise={args.noise}, start area {args.eval_area}, '
+        print(f'{args.name} / {args.which}_model, noise={args.noise}, start area {args.eval_area}, mode {args.mode}, '
               f'{args.eval_episodes} fixed episodes '
               f'({time.time() - t0:.0f} s)\n')
         report(rows)
@@ -244,7 +250,7 @@ def main():
     torch.set_num_threads(1)        # 작은 신경망: 프로세스당 스레드 1개가 가장 빠름
 
     env = SubprocVecEnv([make_env(i, args.seed, args.noise, args.lane_start_prob, args.slot_start_prob,
-                                  args.slot_rear_prob) for i in range(args.n_envs)])
+                                  args.slot_rear_prob, mode) for i in range(args.n_envs)])
     env = VecMonitor(env)
     if args.resume:
         # 이전 실행의 정규화 통계와 모델을 불러와 이어서 학습 (하이퍼파라미터는 저장된 값 그대로)
@@ -269,8 +275,10 @@ def main():
           f'{args.n_envs} envs, noise={args.noise}, starts lane {args.lane_start_prob:.0%} / '
           f'slot {args.slot_start_prob:.0%} (rear {args.slot_rear_prob:.0%}) / '
           f'corridor {1 - args.lane_start_prob - args.slot_start_prob:.0%}, lr {args.learning_rate:g}, '
+          f'mode {args.mode}, eval from {args.eval_area}, '
           f'seed={args.seed}, {start_note} -> {out}', flush=True)
-    cb = EvalCallback(out, args.eval_every, args.eval_episodes, args.noise, args.checkpoint_every)
+    cb = EvalCallback(out, args.eval_every, args.eval_episodes, args.noise, args.checkpoint_every,
+                      args.eval_area, mode)
     t0 = time.time()
     model.learn(total_timesteps=args.steps, callback=cb, tb_log_name='ppo', progress_bar=False,
                 reset_num_timesteps=not args.resume)
