@@ -6,6 +6,9 @@
   - 관측값과 보상을 정규화(VecNormalize). 정규화 통계는 모델과 함께 저장
   - 학습 판의 출발 구역: 칸 앞 통로(--lane-start-prob), 칸 앞 진입 구역(--slot-start-prob), 나머지는 입구 통로
   - --resume <이름>: 그 실행의 모델과 정규화 통계를 불러와 이어서 학습 (단계 수는 이어서 셈)
+  - --learning-rate: 학습률 (이어서 학습할 때 낮추면 후반 성능 하락을 줄이는 데 도움)
+  - --checkpoint-every 단계마다 모델과 정규화 통계를 checkpoints/에 저장 (긴 학습이 중간에 멈춰도 남음)
+  - 평가 줄에 전면(F) / 후면(R) 성공률을 따로 표시
   - --eval-every 단계마다: 학습에 쓰지 않은 "고정" 평가 판 목록(칸 A~D x 전면/후면, 고정 출발 자세,
     항상 입구 통로에서 출발)을 현재 정책으로 탐색 무작위성 없이 주행하고,
     성공 / 접촉 / 이탈 / 시간 초과 비율과 성공한 판의 최종 오차를 기록
@@ -20,7 +23,8 @@
   tensorboard --logdir runs/rl                                            # 그래프 (브라우저: localhost:6006)
 출력: runs/rl/<name>/  best_model.zip, best_vecnormalize.pkl, last_model.zip, last_vecnormalize.pkl,
       eval.csv (평가 1회당 한 줄), args.txt, tb/ (TensorBoard),
-      eval_<best|last>_episodes.csv (--eval-only: 판별 최종 상태)
+      eval_<best|last>_episodes.csv (--eval-only: 판별 최종 상태),
+      checkpoints/step_<단계>_model.zip, step_<단계>_vecnormalize.pkl
 """
 import argparse
 import csv
@@ -44,9 +48,10 @@ REPO = Path(__file__).resolve().parents[1]
 EVAL_SEED0 = 100000                 # 평가 출발 자세는 이 시드부터 만듦 (학습은 다른 시드 사용)
 
 
-def make_env(rank, seed, noise, lane_start_prob, slot_start_prob):
+def make_env(rank, seed, noise, lane_start_prob, slot_start_prob, slot_rear_prob):
     def thunk():
-        env = ParkEnv(noise=noise, lane_start_prob=lane_start_prob, slot_start_prob=slot_start_prob)
+        env = ParkEnv(noise=noise, lane_start_prob=lane_start_prob, slot_start_prob=slot_start_prob,
+                      slot_rear_prob=slot_rear_prob)
         env.reset(seed=seed * 1000 + rank)
         return env
     return thunk
@@ -85,7 +90,10 @@ def evaluate(model, vecnorm, env, episodes):
                      'time_s': info['time_s'], 'lateral_mm': info['lateral_mm'], 'depth_mm': info['depth_mm'],
                      'yaw_deg': info['yaw_deg'], **_final_state(env), 'min_dist_mm': min_dist})
     mean = lambda a: float(np.mean(a)) if a else float('nan')
+    by_mode = {m: [r for r in rows if r['mode'] == m] for m in ('front', 'rear')}
     summary = {**{k: v / episodes for k, v in counts.items()},
+               **{f'success_{m}': (sum(r['result'] == 'success' for r in rs) / len(rs) if rs else float('nan'))
+                  for m, rs in by_mode.items()},
                'lateral_mm': mean(lat), 'depth_mm': mean(dep), 'yaw_deg': mean(yaw), 'time_s': mean(tim)}
     return summary, rows
 
@@ -124,9 +132,10 @@ def report(rows):
 
 
 class EvalCallback(BaseCallback):
-    def __init__(self, out, every, episodes, noise):
+    def __init__(self, out, every, episodes, noise, checkpoint_every=0):
         super().__init__()
         self.out, self.every, self.episodes = out, every, episodes
+        self.checkpoint_every = checkpoint_every
         self.env = ParkEnv(noise=noise)
         self.next, self.best, self.t0 = every, -1.0, time.time()
         self.csv = open(out / 'eval.csv', 'w', newline='')
@@ -135,8 +144,16 @@ class EvalCallback(BaseCallback):
     def _on_training_start(self):
         # 이어서 학습할 때는 단계 수가 0이 아니므로, 첫 평가를 지금부터 eval_every 뒤로 맞춤
         self.next = self.num_timesteps + self.every
+        self.next_ckpt = self.num_timesteps + self.checkpoint_every
 
     def _on_step(self):
+        if self.checkpoint_every and self.num_timesteps >= self.next_ckpt:
+            # 체크포인트: 긴 학습이 중간에 멈춰도 이 시점의 모델이 남음
+            self.next_ckpt += self.checkpoint_every
+            ck = self.out / 'checkpoints'
+            ck.mkdir(exist_ok=True)
+            self.model.save(ck / f'step_{self.num_timesteps}_model')
+            self.model.get_env().save(str(ck / f'step_{self.num_timesteps}_vecnormalize.pkl'))
         if self.num_timesteps < self.next:
             return True
         self.next += self.every
@@ -148,7 +165,8 @@ class EvalCallback(BaseCallback):
             self.writer.writeheader()
         self.writer.writerow(row)
         self.csv.flush()
-        for k in ('success', 'contact', 'out', 'timeout', 'lateral_mm', 'depth_mm', 'yaw_deg', 'time_s'):
+        for k in ('success', 'success_front', 'success_rear', 'contact', 'out', 'timeout',
+                  'lateral_mm', 'depth_mm', 'yaw_deg', 'time_s'):
             self.logger.record(f'eval/{k}', r[k])
         mark = ''
         if r['success'] > self.best:
@@ -156,8 +174,8 @@ class EvalCallback(BaseCallback):
             self.model.save(self.out / 'best_model')
             vecnorm.save(str(self.out / 'best_vecnormalize.pkl'))
             mark = '  <- best'
-        print(f"[{row['minutes']:6.1f} min] {self.num_timesteps:>9,d} steps  success {r['success']:5.1%}  "
-              f"contact {r['contact']:5.1%}  out {r['out']:5.1%}  timeout {r['timeout']:5.1%}  "
+        print(f"[{row['minutes']:6.1f} min] {self.num_timesteps:>9,d} steps  success {r['success']:5.1%} "
+              f"(F {r['success_front']:4.0%} R {r['success_rear']:4.0%})  contact {r['contact']:5.1%}  out {r['out']:5.1%}  timeout {r['timeout']:5.1%}  "
               f"| ok: lateral {r['lateral_mm']:5.1f} mm  depth {r['depth_mm']:5.1f} mm  "
               f"heading {r['yaw_deg']:4.1f} deg  time {r['time_s']:5.1f} s{mark}", flush=True)
         return True
@@ -178,6 +196,11 @@ def main():
     ap.add_argument('--slot-start-prob', type=float, default=0.30,
                     help='training only: share of episodes that start in front of the target slot, near the final '
                          'heading (practise entering and stopping); the rest start in the entrance corridor')
+    ap.add_argument('--slot-rear-prob', type=float, default=0.5,
+                    help='training only: share of slot-start episodes that are rear-in (practise reversing in)')
+    ap.add_argument('--learning-rate', type=float, default=3e-4, help='PPO learning rate (also applied on --resume)')
+    ap.add_argument('--checkpoint-every', type=int, default=1_000_000,
+                    help='save model + normalisation to checkpoints/ every N steps (0 = off)')
     ap.add_argument('--resume', default=None,
                     help='continue training from runs/rl/<RESUME>/<--resume-which>_model + _vecnormalize')
     ap.add_argument('--resume-which', choices=['best', 'last'], default='best')
@@ -214,31 +237,34 @@ def main():
     (out / 'args.txt').write_text('\n'.join(f'{k}={v}' for k, v in vars(args).items()) + '\n')
     torch.set_num_threads(1)        # 작은 신경망: 프로세스당 스레드 1개가 가장 빠름
 
-    env = SubprocVecEnv([make_env(i, args.seed, args.noise, args.lane_start_prob, args.slot_start_prob)
-                         for i in range(args.n_envs)])
+    env = SubprocVecEnv([make_env(i, args.seed, args.noise, args.lane_start_prob, args.slot_start_prob,
+                                  args.slot_rear_prob) for i in range(args.n_envs)])
     env = VecMonitor(env)
     if args.resume:
         # 이전 실행의 정규화 통계와 모델을 불러와 이어서 학습 (하이퍼파라미터는 저장된 값 그대로)
         src = REPO / 'runs/rl' / args.resume
         env = VecNormalize.load(str(src / f'{args.resume_which}_vecnormalize.pkl'), env)
         env.training = True
+        lr = args.learning_rate
         model = PPO.load(src / f'{args.resume_which}_model', env=env, device='cpu',
-                         tensorboard_log=str(out / 'tb'))
+                         tensorboard_log=str(out / 'tb'),
+                         custom_objects={'learning_rate': lr, 'lr_schedule': lambda _: lr})
         model.set_random_seed(args.seed)
         start_note = f'resume {args.resume}/{args.resume_which}_model at {model.num_timesteps:,} steps'
     else:
         env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0, gamma=0.995)
         model = PPO('MlpPolicy', env, seed=args.seed, device='cpu', verbose=0,
                     n_steps=1024, batch_size=512, n_epochs=10, gamma=0.995, gae_lambda=0.95,
-                    learning_rate=3e-4, clip_range=0.2, ent_coef=0.0,
+                    learning_rate=args.learning_rate, clip_range=0.2, ent_coef=0.0,
                     policy_kwargs=dict(net_arch=dict(pi=[128, 128], vf=[128, 128])),
                     tensorboard_log=str(out / 'tb'))
         start_note = 'new model'
     print(f'training {args.name}: {args.steps:,} steps ({args.steps * CTRL_DT / 3600:.0f} h of driving), '
           f'{args.n_envs} envs, noise={args.noise}, starts lane {args.lane_start_prob:.0%} / '
-          f'slot {args.slot_start_prob:.0%} / corridor {1 - args.lane_start_prob - args.slot_start_prob:.0%}, '
+          f'slot {args.slot_start_prob:.0%} (rear {args.slot_rear_prob:.0%}) / '
+          f'corridor {1 - args.lane_start_prob - args.slot_start_prob:.0%}, lr {args.learning_rate:g}, '
           f'seed={args.seed}, {start_note} -> {out}', flush=True)
-    cb = EvalCallback(out, args.eval_every, args.eval_episodes, args.noise)
+    cb = EvalCallback(out, args.eval_every, args.eval_episodes, args.noise, args.checkpoint_every)
     t0 = time.time()
     model.learn(total_timesteps=args.steps, callback=cb, tb_log_name='ppo', progress_bar=False,
                 reset_num_timesteps=not args.resume)

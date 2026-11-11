@@ -12,7 +12,8 @@
      출발 구역: 'corridor' = 입구 통로 (park_closed_loop.py와 같음, 평가에 사용),
                 'lane' = 칸 앞 통로 어디든 (학습 전용: 마지막 동작을 연습).
                 'slot' = 칸 앞 대기점~칸 입구 사이, 목표 방향에 가까운 자세 (학습 전용: 진입·정지 연습).
-     학습 때는 세 구역을 섞는다 (lane_start_prob, slot_start_prob, 나머지는 corridor)
+     학습 때는 세 구역을 섞는다 (lane_start_prob, slot_start_prob, 나머지는 corridor).
+     방식은 반반이지만, 'slot' 출발은 slot_rear_prob 비율로 후면 (후진 진입을 더 자주 연습)
   2. 0.1초(10 Hz)마다 정책이 (직진, 회전) 속도를 내고, 물리를 10 ms씩 10번 진행한다
   3. 성공, 테이프 접촉, 바닥 판 이탈, 시간 초과 중 하나가 되면 판이 끝난다
 
@@ -197,7 +198,7 @@ class ParkEnv(gym.Env):
     metadata = {'render_modes': []}
 
     def __init__(self, noise='ps', slot=None, mode=None, scene=SCENE, contact_ends=True, lane_start_prob=0.5,
-                 slot_start_prob=0.0):
+                 slot_start_prob=0.0, slot_rear_prob=0.5):
         from pinky_mujoco.model import Physics
         self.physics = Physics(scene)
         self.base_z = float(self.physics.model.qpos0[2])
@@ -205,6 +206,7 @@ class ParkEnv(gym.Env):
         self.errors = load_ps_errors() if noise == 'ps' else None
         self.fixed_slot, self.fixed_mode, self.contact_ends = slot, mode, contact_ends
         self.lane_start_prob, self.slot_start_prob = lane_start_prob, slot_start_prob
+        self.slot_rear_prob = slot_rear_prob
         self.max_steps = int(round(TIME_LIMIT_S / CTRL_DT))
         self.action_space = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(17,), dtype=np.float32)
@@ -252,12 +254,14 @@ class ParkEnv(gym.Env):
         options = options or {}
         self.slot = options.get('slot', self.fixed_slot)
         self.slot = int(self.np_random.integers(4)) if self.slot is None else int(self.slot)
-        self.mode = options.get('mode', self.fixed_mode) or ('front' if self.np_random.random() < 0.5 else 'rear')
         area = options.get('area')
         if area is None:
             r = self.np_random.random()
             area = ('slot' if r < self.slot_start_prob else
                     'lane' if r < self.slot_start_prob + self.lane_start_prob else 'corridor')
+        # 방식: 지정이 없으면 전면/후면 반반. 단 'slot' 출발은 slot_rear_prob 비율로 후면 (후진 진입 연습)
+        rear_prob = self.slot_rear_prob if area == 'slot' else 0.5
+        self.mode = options.get('mode', self.fixed_mode) or ('rear' if self.np_random.random() < rear_prob else 'front')
         start = options.get('start') or sample_start(self.np_random, area, self.slot, self.mode)
         self.target = target_pose(self.slot, self.mode)
         self.staging_to_target = abs(STAGING_V - PARK_V[self.mode]) / 1000.0
