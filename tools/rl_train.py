@@ -22,6 +22,8 @@
   python tools/rl_train.py --name ppo_ps_seed0 --eval-only                # 저장된 최고 모델 평가:
                                                                           #   판별 결과 + 시간 초과 원인
   python tools/rl_train.py --name ppo_ps_seed0 --eval-only --eval-area slot   # 진단: 칸 바로 앞에서 출발
+  python tools/rl_train.py --name ppo_ps_seed0 --eval-only --test --eval-episodes 200 --brief   # 별도 테스트 200판
+                                                                          #   (20판마다 진행률, --progress로 간격 변경)
   tensorboard --logdir runs/rl                                            # 그래프 (브라우저: localhost:6006)
 출력: runs/rl/<name>/  best_model.zip, best_vecnormalize.pkl, last_model.zip, last_vecnormalize.pkl,
       eval.csv (평가 1회당 한 줄), args.txt, tb/ (TensorBoard),
@@ -47,7 +49,19 @@ from rl_park_env import (ParkEnv, CTRL_DT, STOP_V, STOP_W,  # noqa: E402
                          OK_LATERAL_MM, OK_DEPTH_MM, OK_YAW_DEG)
 
 REPO = Path(__file__).resolve().parents[1]
-EVAL_SEED0 = 100000                 # 평가 출발 자세는 이 시드부터 만듦 (학습은 다른 시드 사용)
+EVAL_SEED0 = 100000                 # 평가(모델 선택용) 출발 자세는 이 시드부터 만듦 (학습은 다른 시드 사용)
+TEST_SEED0 = 300000                 # 별도 테스트 출발 자세 시드 (학습·모델 선택에 쓰지 않음)
+
+
+def wilson(k, n, z=1.96):
+    """성공 k / n의 Wilson 95% 신뢰구간 (하한, 상한)."""
+    if n == 0:
+        return float('nan'), float('nan')
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return c - h, c + h
 
 
 def make_env(rank, seed, noise, lane_start_prob, slot_start_prob, slot_rear_prob, mode=None):
@@ -68,15 +82,18 @@ def _final_state(env):
             'stopped': bool(abs(v) < STOP_V and abs(w) < STOP_W), 'final_v': float(v), 'final_w': float(w)}
 
 
-def evaluate(model, vecnorm, env, episodes, area='corridor', mode=None):
+def evaluate(model, vecnorm, env, episodes, area='corridor', mode=None, seed0=EVAL_SEED0, progress=0):
     """고정 평가 판, 기본은 입구 통로에서 출발: k번 판 -> 칸 k % 4, 방식은 4판마다 전면/후면을 번갈아,
-    출발 자세는 시드 EVAL_SEED0+k로 만듦. area로 출발 구역을 바꿀 수 있음 (진단용: lane / slot).
+    출발 자세는 시드 seed0+k로 만듦 (기본 EVAL_SEED0, 별도 테스트는 TEST_SEED0).
+    area로 출발 구역을 바꿀 수 있음 (진단용: lane / slot).
+    progress > 0이면 그 판 수마다 진행률(완료 판, 성공 수, 경과 시간, 남은 시간 추정)을 출력.
     mode를 주면 모든 판을 그 방식(front / rear)으로 함.
     반환값: (요약, 판마다 최종 상태를 담은 행 목록)."""
     counts = {'success': 0, 'contact': 0, 'out': 0, 'timeout': 0}
     lat, dep, yaw, tim, rows = [], [], [], [], []
+    t_start = time.time()
     for k in range(episodes):
-        obs, start = env.reset(seed=EVAL_SEED0 + k, options={'slot': k % 4, 'mode': mode or ('front', 'rear')[(k // 4) % 2],
+        obs, start = env.reset(seed=seed0 + k, options={'slot': k % 4, 'mode': mode or ('front', 'rear')[(k // 4) % 2],
                                                                 'area': area})
         done, min_dist = False, float('inf')
         while not done:
@@ -92,6 +109,12 @@ def evaluate(model, vecnorm, env, episodes, area='corridor', mode=None):
         rows.append({'episode': k, 'slot': start['slot'], 'mode': start['mode'], 'result': info['result'],
                      'time_s': info['time_s'], 'lateral_mm': info['lateral_mm'], 'depth_mm': info['depth_mm'],
                      'yaw_deg': info['yaw_deg'], **_final_state(env), 'min_dist_mm': min_dist})
+        if progress and ((k + 1) % progress == 0 or k + 1 == episodes):
+            el = time.time() - t_start
+            eta = el / (k + 1) * (episodes - k - 1)
+            print(f'  [{k + 1:4d}/{episodes}] success {counts["success"]}/{k + 1} '
+                  f'({counts["success"] / (k + 1):.1%})  contact {counts["contact"]}  timeout {counts["timeout"]}  '
+                  f'| {el / 60:.1f} min elapsed, ~{eta / 60:.1f} min left', flush=True)
     mean = lambda a: float(np.mean(a)) if a else float('nan')
     by_mode = {m: [r for r in rows if r['mode'] == m] for m in ('front', 'rear')}
     summary = {**{k: v / episodes for k, v in counts.items()},
@@ -101,8 +124,32 @@ def evaluate(model, vecnorm, env, episodes, area='corridor', mode=None):
     return summary, rows
 
 
-def report(rows):
-    """판별 결과 표 + 시간 초과 판이 성공으로 인정되지 않은 이유."""
+def print_summary(rows, summary, path, test=False):
+    """요약 한 줄 + 성공률의 Wilson 95% 신뢰구간 (전체 / 전면 / 후면)."""
+    def ci(sel):
+        k, n = sum(r['result'] == 'success' for r in sel), len(sel)
+        lo, hi = wilson(k, n)
+        return f'{k}/{n} = {k / n:.1%} [95% CI {lo:.1%}-{hi:.1%}]' if n else 'n/a'
+    print(f"\n{'TEST' if test else 'eval'}: all {ci(rows)}")
+    print(f"      front {ci([r for r in rows if r['mode'] == 'front'])}")
+    print(f"      rear  {ci([r for r in rows if r['mode'] == 'rear'])}")
+    ok = [r for r in rows if r['result'] == 'success']
+    if ok:
+        print(f"      successful episodes: lateral {np.mean([r['lateral_mm'] for r in ok]):.1f} mm, depth "
+              f"{np.mean([r['depth_mm'] for r in ok]):.1f} mm, heading {np.mean([r['yaw_deg'] for r in ok]):.1f} deg, "
+              f"time {np.mean([r['time_s'] for r in ok]):.1f} s")
+    print(f"success {summary['success']:.1%}  contact {summary['contact']:.1%}  out {summary['out']:.1%}  "
+          f"timeout {summary['timeout']:.1%}  -> {path}")
+
+
+def report(rows, brief=False):
+    """판별 결과 표 + 시간 초과 판이 성공으로 인정되지 않은 이유. brief면 판별 표는 생략."""
+    if not brief:
+        _episode_table(rows)
+    _timeout_and_slot_summary(rows)
+
+
+def _episode_table(rows):
     print(f"{'ep':>3} {'slot':>4} {'mode':>5} {'result':>8} {'time':>5} {'dist':>6} {'min':>6} "
           f"{'lat':>6} {'depth±':>7} {'head':>5} {'stop':>4}")
     for r in rows:
@@ -112,6 +159,8 @@ def report(rows):
     print('(mm / deg / s; dist = final distance to target, min = closest during the episode, '
           'depth± > 0 = not deep enough, stop = stopped at the end)')
 
+
+def _timeout_and_slot_summary(rows):
     to = [r for r in rows if r['result'] == 'timeout']
     if to:
         near = [r for r in to if r['dist_mm'] <= 50]
@@ -217,6 +266,13 @@ def main():
     ap.add_argument('--eval-area', choices=['corridor', 'lane', 'slot'], default='corridor',
                     help='start area of the evaluation episodes (--eval-only and training-time evaluation; '
                          'corridor = the standard evaluation, lane / slot = diagnosis or staged experiments)')
+    ap.add_argument('--test', action='store_true',
+                    help='--eval-only: use the separate test start poses (seed TEST_SEED0, never used for training or '
+                         'model selection) instead of the model-selection evaluation; use with --eval-episodes 200')
+    ap.add_argument('--progress', type=int, default=20,
+                    help='--eval-only: print progress every N episodes (0 = off)')
+    ap.add_argument('--brief', action='store_true',
+                    help='--eval-only: skip the per-episode table (keep slot/mode counts and the summary)')
     ap.add_argument('--mode', choices=['both', 'front', 'rear'], default='both',
                     help='parking mode of the training and evaluation episodes (front / rear = one mode only)')
     args = ap.parse_args()
@@ -231,8 +287,10 @@ def main():
                                     DummyVecEnv([lambda: ParkEnv(noise=args.noise)]))
         vecnorm.training = False
         t0 = time.time()
-        summary, rows = evaluate(model, vecnorm, ParkEnv(noise=args.noise), args.eval_episodes, args.eval_area, mode)
-        suffix = ('' if args.eval_area == 'corridor' else f'_{args.eval_area}') + (f'_{mode}' if mode else '')
+        summary, rows = evaluate(model, vecnorm, ParkEnv(noise=args.noise), args.eval_episodes, args.eval_area, mode,
+                                 TEST_SEED0 if args.test else EVAL_SEED0, args.progress)
+        suffix = (('_test' if args.test else '') + ('' if args.eval_area == 'corridor' else f'_{args.eval_area}')
+                  + (f'_{mode}' if mode else ''))
         path = out / f'eval_{args.which}_episodes{suffix}.csv'
         with open(path, 'w', newline='') as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0]))
@@ -241,9 +299,8 @@ def main():
         print(f'{args.name} / {args.which}_model, noise={args.noise}, start area {args.eval_area}, mode {args.mode}, '
               f'{args.eval_episodes} fixed episodes '
               f'({time.time() - t0:.0f} s)\n')
-        report(rows)
-        print(f"\nsuccess {summary['success']:.1%}  contact {summary['contact']:.1%}  out {summary['out']:.1%}  "
-              f"timeout {summary['timeout']:.1%}  -> {path}")
+        report(rows, args.brief)
+        print_summary(rows, summary, path, args.test)
         return
     out.mkdir(parents=True, exist_ok=True)
     (out / 'args.txt').write_text('\n'.join(f'{k}={v}' for k, v in vars(args).items()) + '\n')

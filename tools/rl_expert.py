@@ -17,6 +17,7 @@
   python tools/rl_expert.py                         # 케이스 A: 노이즈 자세로 고정 평가 40판 (입구 통로 출발)
   python tools/rl_expert.py --pose truth            # 참고: 정답 자세로 운전
   python tools/rl_expert.py --eval-area slot --mode rear
+  python tools/rl_expert.py --test --eval-episodes 200 --brief   # 별도 테스트 200판 (20판마다 진행률)
 출력: runs/rl/expert_<pose>/eval_best_episodes[_<area>][_<mode>].csv
 """
 import argparse
@@ -127,7 +128,7 @@ class ExpertPolicy:
 
 
 def main():
-    from rl_train import evaluate, report
+    from rl_train import evaluate, report, print_summary, EVAL_SEED0, TEST_SEED0
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--pose', choices=['noisy', 'truth'], default='noisy',
                     help='noisy = same observation as the policy (case A), truth = ground-truth pose')
@@ -135,15 +136,21 @@ def main():
     ap.add_argument('--eval-area', choices=['corridor', 'lane', 'slot'], default='corridor')
     ap.add_argument('--mode', choices=['both', 'front', 'rear'], default='both')
     ap.add_argument('--eval-episodes', type=int, default=40)
+    ap.add_argument('--progress', type=int, default=20, help='print progress every N episodes (0 = off)')
+    ap.add_argument('--brief', action='store_true', help='skip the per-episode table')
+    ap.add_argument('--test', action='store_true',
+                    help='separate test start poses (seed TEST_SEED0); use with --eval-episodes 200')
     args = ap.parse_args()
     mode = None if args.mode == 'both' else args.mode
     env = ParkEnv(noise=args.noise)
     pol = ExpertPolicy(env, args.pose == 'truth')
     t0 = time.time()
-    summary, rows = evaluate(pol, pol, env, args.eval_episodes, args.eval_area, mode)
+    summary, rows = evaluate(pol, pol, env, args.eval_episodes, args.eval_area, mode,
+                             TEST_SEED0 if args.test else EVAL_SEED0, args.progress)
     out = REPO / 'runs/rl' / f'expert_{args.pose}'
     out.mkdir(parents=True, exist_ok=True)
-    suffix = ('' if args.eval_area == 'corridor' else f'_{args.eval_area}') + (f'_{mode}' if mode else '')
+    suffix = (('_test' if args.test else '') + ('' if args.eval_area == 'corridor' else f'_{args.eval_area}')
+              + (f'_{mode}' if mode else ''))
     path = out / f'eval_best_episodes{suffix}.csv'
     with open(path, 'w', newline='') as f:
         wr = csv.DictWriter(f, fieldnames=list(rows[0]))
@@ -151,9 +158,8 @@ def main():
         wr.writerows(rows)
     print(f'expert (case A), pose={args.pose}, noise={args.noise}, start area {args.eval_area}, mode {args.mode}, '
           f'{args.eval_episodes} fixed episodes ({time.time() - t0:.0f} s)\n')
-    report(rows)
-    print(f"\nsuccess {summary['success']:.1%} (F {summary['success_front']:.0%} R {summary['success_rear']:.0%})  "
-          f"contact {summary['contact']:.1%}  out {summary['out']:.1%}  timeout {summary['timeout']:.1%}  -> {path}")
+    report(rows, args.brief)
+    print_summary(rows, summary, path, args.test)
 
 
 if __name__ == '__main__':
