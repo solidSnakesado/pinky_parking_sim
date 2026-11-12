@@ -16,6 +16,8 @@
   python tools/eval_sequence.py --method pb
   python tools/eval_sequence.py --method ps --weights runs/segment/runs/ps/yolo11n_seed0/weights/best.pt
   python tools/eval_sequence.py --method pa --reuse      # 필터만 다시, 저장된 raw 추정값 재사용
+  python tools/eval_sequence.py --method pa --filter v2 --reuse results/seq_pa.csv --out results/seq_pa_v2.csv
+    v2 필터: 앞/뒤를 오도메트리로 유지 (run_filter_v2 참고). --reuse CSV로 다른 파일의 raw 추정값을 쓸 수 있다.
 출력: results/seq_<method>.csv (프레임별)
 """
 import argparse
@@ -139,6 +141,83 @@ def run_filter(rows):
     return rows
 
 
+CONFIRM_TRAVEL_M = 0.03      # v2: 앞/뒤 확정에 쓰는 직진 거리 (오도메트리)
+CONFIRM_MIN_DISP_M = 0.015   # v2: 측정 위치가 이만큼은 움직여야 방향 비교를 함
+
+
+def run_filter_v2(rows):
+    """v2: 앞/뒤는 오도메트리로 유지한다.
+
+    - 확정 전: v1과 같은 앞/뒤 규칙(반대 측정 3번 연속이면 상태를 뒤집음).
+    - 시작 확인: 오도메트리로 CONFIRM_TRAVEL_M 이상 직진하면, 그동안 측정 위치가 실제로 움직인 방향과
+      상태 방향(+ 전진/후진 부호)을 비교해 반대면 상태를 한 번 뒤집고 앞/뒤를 확정한다.
+      위치 측정은 앞/뒤 판단과 관계없으므로 이동 방향은 믿을 수 있다.
+    - 확정 후: 측정으로 상태를 뒤집지 않는다. 측정 방향은 상태와 가까운 쪽(±180°)으로 맞춰서만 쓴다.
+    - 재초기화(이상값 RESET_AFTER번 연속): 위치는 측정값으로, 방향은 확정 후라면 맞춘 측정 방향
+      (상태와 가까운 쪽)으로 다시 시작해 앞/뒤가 바뀌지 않게 한다.
+    """
+    by_run = {}
+    for r in rows:
+        by_run.setdefault(r['run'], []).append(r)
+    for frames in by_run.values():
+        state = odo = None
+        prev_odom = None
+        flips = skips = 0
+        confirmed, anchor, travel = False, None, 0.0
+        for r in frames:
+            odom = (float(r['odom_x']), float(r['odom_y']), float(r['odom_yaw']))
+            meas = None
+            if r.get('raw_x') not in (None, ''):
+                meas = [float(r['raw_x']), float(r['raw_y']), float(r['raw_yaw'])]
+            if state is not None:                                       # 오도메트리로 예측
+                d = body_delta(prev_odom, odom)
+                state = apply_delta(state, d)
+                odo = apply_delta(odo, d)
+                travel += d[0]                                          # 로봇 앞쪽 방향 이동 거리 (후진은 음수)
+            prev_odom = odom
+            if meas is not None:
+                if state is None:                                       # 첫 측정에서 시작
+                    state, odo = list(meas), list(meas)
+                    anchor, travel = meas[:2], 0.0
+                else:
+                    if not confirmed and abs(travel) >= CONFIRM_TRAVEL_M:   # 시작 확인: 이동 방향으로 앞/뒤 확정
+                        dx, dy = meas[0] - anchor[0], meas[1] - anchor[1]
+                        if math.hypot(dx, dy) >= CONFIRM_MIN_DISP_M:
+                            sign = 1.0 if travel > 0 else -1.0
+                            if sign * (dx * math.cos(state[2]) + dy * math.sin(state[2])) < 0:
+                                state[2] = G.wrap(state[2] + math.pi)
+                            confirmed, flips = True, 0
+                    if abs(G.wrap(meas[2] - state[2])) > math.pi / 2:   # 앞/뒤가 서로 다름
+                        if confirmed:                                   # 확정 후: 측정 쪽만 돌림
+                            meas[2] = G.wrap(meas[2] + math.pi)
+                        else:
+                            flips += 1
+                            if flips >= FLIP_CONFIRM:
+                                state[2] = G.wrap(state[2] + math.pi)
+                                flips = 0
+                            else:
+                                meas[2] = G.wrap(meas[2] + math.pi)
+                    else:
+                        flips = 0
+                    dpos = math.hypot(meas[0] - state[0], meas[1] - state[1])
+                    dyaw = abs(math.degrees(G.wrap(meas[2] - state[2])))
+                    if dpos > GATE_POS_M or dyaw > GATE_YAW_DEG:        # 이상값
+                        skips += 1
+                        if skips >= RESET_AFTER:
+                            state, skips = list(meas), 0
+                            if not confirmed:                           # 확정 전이면 확인 기준점도 다시
+                                anchor, travel = meas[:2], 0.0
+                    else:
+                        skips = 0
+                        state[0] += GAIN_POS * (meas[0] - state[0])
+                        state[1] += GAIN_POS * (meas[1] - state[1])
+                        state[2] = G.wrap(state[2] + GAIN_YAW * G.wrap(meas[2] - state[2]))
+            if state is not None:
+                r.update(fil_x=state[0], fil_y=state[1], fil_yaw=state[2],
+                         odo_x=odo[0], odo_y=odo[1], odo_yaw=odo[2])
+    return rows
+
+
 def errors(rows, prefix):
     pos, yaw = [], []
     for r in rows:
@@ -169,9 +248,12 @@ def main():
     ap.add_argument('--method', default='pa', choices=['pa', 'pb', 'ps'])
     ap.add_argument('--weights', default=None)
     ap.add_argument('--out', default=None)
-    ap.add_argument('--reuse', action='store_true', help='reuse raw estimates from --out, run the filter only')
+    ap.add_argument('--reuse', nargs='?', const='', default=None, metavar='CSV',
+                    help='reuse raw estimates and run the filter only (from CSV, default --out)')
+    ap.add_argument('--filter', default='v1', choices=['v1', 'v2'],
+                    help='v1: original rules; v2: front/back kept by odometry after a motion check')
     args = ap.parse_args()
-    if args.method == 'ps' and not args.weights and not args.reuse:
+    if args.method == 'ps' and not args.weights and args.reuse is None:
         raise SystemExit('--weights is required for ps')
 
     data = Path(os.path.expanduser(args.data))
@@ -181,11 +263,11 @@ def main():
     for run in runs:
         for k in ('cam_x', 'cam_y', 'cam_z', 'cam_qw', 'cam_qx', 'cam_qy', 'cam_qz'):
             run[k] = float(run[k])
-    if args.reuse:
-        rows = read_csv(out)
+    if args.reuse is not None:
+        rows = read_csv(args.reuse or out)
     else:
         rows = run_raw(data, runs, args.method, args.weights)
-    rows = run_filter(rows)
+    rows = run_filter_v2(rows) if args.filter == 'v2' else run_filter(rows)
 
     keys = ['run', 'frame', 't', 'phase', 'gt_x', 'gt_y', 'gt_yaw', 'odom_x', 'odom_y', 'odom_yaw',
             'raw_x', 'raw_y', 'raw_yaw', 'fil_x', 'fil_y', 'fil_yaw', 'odo_x', 'odo_y', 'odo_yaw']
@@ -195,7 +277,7 @@ def main():
         for r in rows:
             w.writerow({k: r.get(k, '') for k in keys})
 
-    print(f'method={args.method} runs={len(runs)} -> {out}')
+    print(f'method={args.method} filter={args.filter} runs={len(runs)} -> {out}')
     print(summary(rows, 'all frames'))
     print(summary([r for r in rows if r['phase'] == 'hold'], 'parked (hold phase)'))
     last = {}
