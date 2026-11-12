@@ -10,6 +10,12 @@
   4. 브리지 종료
 끝나면 rl_train.py --eval-only와 같은 형식의 요약(칸·방식별 성공, Wilson 95% 신뢰구간) + 명령 주기·처리 시간
 
+--perception pa|ps: 정답 자세 대신 인식 루프로 주행 (실물과 같은 구성의 시뮬):
+           브리지 -> ceiling_cam_sim_node (천장 영상) -> pose_perception_node (인식 + 필터 -> /perceived_pose)
+           -> 정책 노드는 추정 자세를 관측에 씀 (노이즈 추가 없음). 판정은 계속 정답 자세로 함.
+           세 노드를 판마다 새로 띄우고, 로그는 ros_logs/{camera,perception}_XXX.log.
+           요약에 인식 오차(정책이 본 자세 vs 정답), 인식 지연(시뮬 시간), 인식 처리 시간, 검출률을 더함
+
 --dry-run: ROS 없이 같은 로직을 MuJoCo 물리에 직접 연결해 실행 (브리지와 같은 10 ms 물리, 50 Hz 자세,
            한 메시지 늦게 적용되는 명령). ROS 문제와 정책 문제를 나눠 보기 위함
 
@@ -18,10 +24,13 @@
   python tools/ros_park_eval.py --name bc_ppo_seed0 --which last --test --episodes 2     # 동작 확인
   python tools/ros_park_eval.py --name bc_ppo_seed0 --which last --test --episodes 40
   python tools/ros_park_eval.py --name bc_ppo_seed0 --which last --test --episodes 40 --dry-run
-출력: runs/rl/<name>/ros_eval_<which>[_test][_dry].csv, 브리지 로그 runs/rl/<name>/ros_logs/
+  python tools/ros_park_eval.py --name bc_ppo_seed2_tp10 --which last --test --episodes 2 --perception pa
+  python tools/ros_park_eval.py --name bc_ppo_seed2_tp10 --which last --test --episodes 40 --perception ps --weights best.pt
+출력: runs/rl/<name>/ros_eval_<which>[_test][_dry|_pa|_ps].csv, 로그 runs/rl/<name>/ros_logs/
 """
 import argparse
 import csv
+import json
 import math
 import os
 import signal
@@ -88,8 +97,18 @@ def run_ros(policy, slot, mode, start, noise, seed, k, args, tmp, logdir):
                              '--no-camera', '--world', str(args.world),
                              '--physics-config', str(cfg_path), '--output-dir', str(Path(tmp) / 'model')],
                             stdout=log, stderr=subprocess.STDOUT)
-    ep = ParkEpisode(policy, slot, mode, start[2], noise, seed)
-    node = make_node(ep, name=f'park_policy_{k}')
+    helpers, stats_path = [], Path(tmp) / f'perception_{k}.json'
+    if args.perception != 'none':                         # 천장 카메라 시뮬 + 인식 노드
+        tools = Path(__file__).resolve().parent
+        cam_cmd = [sys.executable, str(tools / 'ceiling_cam_sim_node.py'), '--seed', str(seed)]
+        perc_cmd = [sys.executable, str(tools / 'pose_perception_node.py'), '--method', args.perception,
+                    '--stats-file', str(stats_path)] + (['--weights', args.weights] if args.weights else [])
+        for name, cmd in (('camera', cam_cmd), ('perception', perc_cmd)):
+            lg = open(logdir / f'{name}_{k:03d}.log', 'w')
+            helpers.append((subprocess.Popen(cmd, stdout=lg, stderr=subprocess.STDOUT), lg))
+    use_est = args.perception != 'none'
+    ep = ParkEpisode(policy, slot, mode, start[2], noise, seed, use_est=use_est)
+    node = make_node(ep, name=f'park_policy_{k}', est_topic='/perceived_pose' if use_est else None)
     t_start = time.monotonic()
     info, timing = None, {}
     try:
@@ -97,6 +116,9 @@ def run_ros(policy, slot, mode, start, noise, seed, k, args, tmp, logdir):
             rclpy.spin_once(node, timeout_sec=0.05)
             if proc.poll() is not None:
                 info = {'result': 'bridge_exit'}
+                break
+            if any(h.poll() is not None for h, _ in helpers):
+                info = {'result': 'helper_exit'}
                 break
             if time.monotonic() - t_start > args.wall_timeout:
                 info = {'result': 'wall_timeout'}
@@ -107,14 +129,17 @@ def run_ros(policy, slot, mode, start, noise, seed, k, args, tmp, logdir):
             timing['spawn_error_mm'] = math.hypot(node.first_pose[0] - start[0], node.first_pose[1] - start[1]) * 1000
     finally:
         node.destroy_node()
-        if proc.poll() is None:
-            proc.send_signal(signal.SIGINT)
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-        log.close()
+        for p_, lg in helpers + [(proc, log)]:            # 인식·카메라 노드 먼저, 브리지 마지막
+            if p_.poll() is None:
+                p_.send_signal(signal.SIGINT)
+                try:
+                    p_.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    p_.kill()
+                    p_.wait()
+            lg.close()
+    if stats_path.is_file():
+        timing.update({k2: v for k2, v in json.loads(stats_path.read_text()).items() if k2 != 'method'})
     timing['wall_s'] = time.monotonic() - t_start
     return info or ep.info, timing
 
@@ -132,7 +157,14 @@ def main():
                                                   'if it exists, else worlds/parking_course.sdf)')
     ap.add_argument('--wall-timeout', type=float, default=180.0, help='max real seconds per episode (bridge start incl.)')
     ap.add_argument('--brief', action='store_true', help='skip the per-episode table')
+    ap.add_argument('--perception', choices=['none', 'pa', 'ps'], default='none',
+                    help='drive on perceived pose (ceiling camera sim + recognition node) instead of ground truth')
+    ap.add_argument('--weights', default=None, help='YOLO-seg weights for --perception ps')
     args = ap.parse_args()
+    if args.perception == 'ps' and not args.weights:
+        raise SystemExit('--weights is required for --perception ps')
+    if args.perception != 'none' and args.dry_run:
+        raise SystemExit('--perception needs ROS (not --dry-run)')
     if args.world is None:
         local = REPO / 'worlds/parking_course_local.sdf'
         args.world = local if local.is_file() else REPO / 'worlds/parking_course.sdf'
@@ -140,12 +172,13 @@ def main():
     run = REPO / 'runs/rl' / args.name
     policy = NumpyPolicy(run / f'policy_{args.which}.npz')
     seed0 = TEST_SEED0 if args.test else EVAL_SEED0
-    suffix = ('_test' if args.test else '') + ('_dry' if args.dry_run else '')
+    suffix = ('_test' if args.test else '') + ('_dry' if args.dry_run else '') + \
+        ('' if args.perception == 'none' else f'_{args.perception}')
     out = run / f'ros_eval_{args.which}{suffix}.csv'
     logdir = run / 'ros_logs'
     logdir.mkdir(parents=True, exist_ok=True)
     print(f'{args.name} / policy_{args.which}.npz, {"dry run (no ROS)" if args.dry_run else "ROS 2 + MuJoCo bridge"}, '
-          f'noise={args.noise}, start poses seed {seed0}+k, episodes {args.first}..{args.episodes - 1}, '
+          f'{"noise=" + args.noise if args.perception == "none" else "perception=" + args.perception}, start poses seed {seed0}+k, episodes {args.first}..{args.episodes - 1}, '
           f'world {Path(args.world).name}', flush=True)
 
     if not args.dry_run:
@@ -169,6 +202,10 @@ def main():
             eta = el / len(rows) * (args.episodes - args.first - len(rows))
             extra = (f"  cmd gap {timing['cmd_gap_mean_ms']:.0f}/{timing['cmd_gap_max_ms']:.0f} ms, "
                      f"compute {timing['compute_mean_ms']:.1f} ms" if 'cmd_gap_mean_ms' in timing else '')
+            if 'est_err_mean_mm' in timing:
+                extra += (f", est err {timing['est_err_mean_mm']:.1f} mm / {timing['est_err_mean_deg']:.1f} deg, "
+                          f"age {timing.get('est_age_mean_ms', float('nan')):.0f} ms, "
+                          f"perception {timing.get('perc_compute_mean_ms', float('nan')):.0f} ms")
             print(f"  [{k + 1:4d}/{args.episodes}] {'ABCD'[slot]} {mode:5s} -> {row['result']:12s} "
                   f"t={row['time_s'] if row['time_s'] == row['time_s'] else 0:5.1f} s | success {n_ok}/{len(rows)} "
                   f"| {el / 60:.1f} min, ~{eta / 60:.1f} min left{extra}", flush=True)
@@ -198,6 +235,15 @@ def main():
                   f"{np.mean([r['compute_mean_ms'] for r in g]):.2f} ms (max {max(r['compute_max_ms'] for r in g):.1f} ms), "
                   f"wall per episode {np.mean([r['wall_s'] for r in g]):.0f} s, "
                   f"spawn error max {max(r.get('spawn_error_mm', 0) for r in g):.1f} mm")
+        e = [r for r in rows if 'est_err_mean_mm' in r]
+        if e:
+            print(f"perception ({args.perception}): pose error seen by the policy mean "
+                  f"{np.mean([r['est_err_mean_mm'] for r in e]):.1f} mm (p95 per episode up to "
+                  f"{max(r['est_err_p95_mm'] for r in e):.1f} mm), heading {np.mean([r['est_err_mean_deg'] for r in e]):.2f} deg, "
+                  f"age mean {np.nanmean([r.get('est_age_mean_ms', np.nan) for r in e]):.0f} ms "
+                  f"(max {np.nanmax([r.get('est_age_max_ms', np.nan) for r in e]):.0f} ms), "
+                  f"compute mean {np.nanmean([r.get('perc_compute_mean_ms', np.nan) for r in e]):.1f} ms, "
+                  f"detect rate {np.nanmean([r.get('detect_rate', np.nan) for r in e]):.1%}")
 
 
 if __name__ == '__main__':

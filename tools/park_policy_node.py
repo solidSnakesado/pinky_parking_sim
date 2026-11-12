@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""ROS 2 주차 정책 노드: /ground_truth (+ P-S 노이즈) -> 관측 17개 -> 정책 -> /cmd_vel.
+"""ROS 2 주차 정책 노드: 자세 -> 관측 17개 -> 정책 -> /cmd_vel.
+
+자세 입력 두 가지
+  - 기본: /ground_truth (+ 학습 때와 같은 P-S 노이즈). 시뮬 검증용
+  - --est-topic /perceived_pose: 인식 노드(pose_perception_node.py)가 낸 추정 자세를 관측에 씀 (노이즈 없음,
+    실제 인식 오차가 이미 들어 있음). 판정(접촉, 성공)은 시뮬에서는 계속 /ground_truth로 함
 
 무엇인가
   학습한 정책(export_policy.py로 만든 policy_*.npz)을 ROS 2로 돌린다. 관측은 학습 환경과 같은 함수
@@ -7,17 +12,20 @@
   실물 핑키도 같은 /cmd_vel을 받으므로, 자세 입력만 인식 노드로 바꾸면 실물에서도 그대로 쓴다.
 
 한 판의 단계 (ParkEpisode, ROS와 무관한 로직)
+  0. wait   : (추정 자세 사용 시) 인식 노드의 첫 추정 자세가 올 때까지 정지 (필터는 정지 상태에서 시작해야 함)
   1. turn   : 출발 방향(start_yaw)까지 제자리 회전 (브리지는 출발 위치만 정할 수 있어서)
   2. policy : 시뮬 시간 0.1초마다 관측 -> 정책 -> 명령 (그 사이에는 같은 명령 유지)
   3. 끝     : 성공(정지 + 좌우·깊이 <= 20 mm, 방향 <= 5°), 테이프 접촉, 이탈, 60초 초과
   자세가 들어올 때마다(50 Hz) 접촉을 확인하고, 성공·이탈은 0.1초 경계에서 확인 (학습 환경과 같은 순서)
 
 토픽
-  구독: /ground_truth (geometry_msgs/PoseStamped, 시뮬 시간 도장), /odom (nav_msgs/Odometry, 현재 속도)
+  구독: /ground_truth (geometry_msgs/PoseStamped, 시뮬 시간 도장), /odom (nav_msgs/Odometry, 현재 속도),
+        (선택) 추정 자세 토픽 (geometry_msgs/PoseStamped, 영상 시각 도장)
   발행: /cmd_vel (geometry_msgs/Twist), 자세가 들어올 때마다 (브리지 명령 끊김 0.5초 방지)
 
 사용법 (pinky_train 가상환경, ROS 2 + 이 작업 공간 source, 브리지가 실행 중일 때):
   python tools/park_policy_node.py --policy runs/rl/bc_ppo_seed0/policy_last.npz --slot B --mode rear
+  python tools/park_policy_node.py --policy ... --slot B --mode rear --est-topic /perceived_pose   # 인식 자세 사용
 여러 판 평가는 ros_park_eval.py가 이 파일의 ParkEpisode / ParkPolicyNode를 불러 쓴다.
 """
 import argparse
@@ -42,13 +50,15 @@ TURN_SETTLE_W = 0.05               # 회전이 멈췄다고 볼 각속도 (rad/s
 class ParkEpisode:
     """한 판의 주행 로직 (ROS와 무관). on_state(시뮬 시간, 정답 자세, 오도메트리 속도) -> (v, w)."""
 
-    def __init__(self, policy, slot, mode, start_yaw=None, noise='ps', seed=0):
+    def __init__(self, policy, slot, mode, start_yaw=None, noise='ps', seed=0, use_est=False):
         self.policy, self.slot, self.mode = policy, slot, mode
         self.start_yaw = start_yaw
         self.target = target_pose(slot, mode)
-        self.errors = load_ps_errors() if noise == 'ps' else None
+        self.use_est = use_est                    # True: 관측에 추정 자세 사용 (노이즈를 더하지 않음)
+        self.errors = load_ps_errors() if noise == 'ps' and not use_est else None
         self.rng = np.random.default_rng(seed)
-        self.phase = 'turn' if start_yaw is not None else 'policy'
+        self.phase = 'wait' if use_est else ('turn' if start_yaw is not None else 'policy')
+        self.est_err_mm, self.est_err_deg, self.est_age_ms = [], [], []   # 정책이 쓴 추정 자세의 오차·나이
         self.t0 = self.next_act = None
         self.prev_action = np.zeros(2)
         self.command = (0.0, 0.0)
@@ -73,10 +83,17 @@ class ParkEpisode:
                      'final_v': float(twist[0]), 'final_w': float(twist[1])}
         self.command = (0.0, 0.0)
 
-    def on_state(self, t, pose, twist):
+    def on_state(self, t, pose, twist, est=None, est_t=None):
+        """pose = 정답 자세 (판정용), est = 추정 자세 (use_est일 때 관측용), est_t = 추정 자세의 시각."""
         if self.result is not None:
             return 0.0, 0.0
         pose = np.asarray(pose, float)
+        if self.phase == 'wait':
+            if est is None:
+                return 0.0, 0.0
+            self.phase = 'turn' if self.start_yaw is not None else 'policy'
+            if self.phase == 'policy':
+                self.t0 = self.next_act = t
         if self.phase == 'turn':
             err = G.wrap(self.start_yaw - pose[2])
             if abs(err) < TURN_TOL and abs(twist[1]) < TURN_SETTLE_W:
@@ -102,7 +119,15 @@ class ParkEpisode:
                 if self.steps * CTRL_DT >= TIME_LIMIT_S - 1e-9:
                     self._finish('timeout', t, pose, twist)
                     return self.command
-            obs = make_obs(self._measured(pose), self.target, self.slot, self.mode, twist, self.prev_action)
+            if self.use_est:
+                seen = np.asarray(est, float)
+                self.est_err_mm.append(math.hypot(seen[0] - pose[0], seen[1] - pose[1]) * 1000)
+                self.est_err_deg.append(abs(math.degrees(G.wrap(seen[2] - pose[2]))))
+                if est_t is not None:
+                    self.est_age_ms.append((t - est_t) * 1000)
+            else:
+                seen = self._measured(pose)
+            obs = make_obs(seen, self.target, self.slot, self.mode, twist, self.prev_action)
             a = self.policy.act(obs)
             self.prev_action = a
             self.command = (float(a[0] * V_MAX), float(a[1] * W_MAX))
@@ -111,8 +136,8 @@ class ParkEpisode:
         return self.command
 
 
-def make_node(episode, name='park_policy'):
-    """ParkEpisode를 ROS 2 노드로 감싼다 (rclpy.init() 이후 호출)."""
+def make_node(episode, name='park_policy', est_topic=None):
+    """ParkEpisode를 ROS 2 노드로 감싼다 (rclpy.init() 이후 호출). est_topic: 추정 자세 토픽 (없으면 정답만)."""
     from rclpy.node import Node
     from geometry_msgs.msg import PoseStamped, Twist
     from nav_msgs.msg import Odometry
@@ -127,7 +152,20 @@ def make_node(episode, name='park_policy'):
             self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
             self.create_subscription(Odometry, '/odom', self.on_odom, 10)
             self.create_subscription(PoseStamped, '/ground_truth', self.on_truth, 10)
+            self.est, self.est_t = None, None
+            if est_topic:
+                self.create_subscription(PoseStamped, est_topic, self.on_est, 10)
             self.compute_ms, self.pub_wall = [], []
+
+        @staticmethod
+        def _pose(msg):
+            t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            q = msg.pose.orientation
+            yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+            return t, (msg.pose.position.x, msg.pose.position.y, yaw)
+
+        def on_est(self, msg):
+            self.est_t, self.est = self._pose(msg)
 
         def on_odom(self, msg):
             self.twist = (msg.twist.twist.linear.x, msg.twist.twist.angular.z)
@@ -137,13 +175,10 @@ def make_node(episode, name='park_policy'):
             if not self.got_odom:
                 return
             c0 = time.perf_counter()
-            t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-            q = msg.pose.orientation
-            yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
-            pose = (msg.pose.position.x, msg.pose.position.y, yaw)
+            t, pose = self._pose(msg)
             if self.first_pose is None:
                 self.first_pose = pose
-            v, w = self.episode.on_state(t, pose, self.twist)
+            v, w = self.episode.on_state(t, pose, self.twist, self.est, self.est_t)
             cmd = Twist()
             cmd.linear.x, cmd.angular.z = float(v), float(w)
             self.pub.publish(cmd)
@@ -158,8 +193,15 @@ def make_node(episode, name='park_policy'):
             """명령 발행 간격 (실제 시간, ms)과 노드 처리 시간 (ms) 통계."""
             gaps = np.diff(self.pub_wall) * 1000 if len(self.pub_wall) > 1 else np.zeros(1)
             comp = np.array(self.compute_ms or [0.0])
-            return {'cmd_gap_mean_ms': float(gaps.mean()), 'cmd_gap_max_ms': float(gaps.max()),
-                    'compute_mean_ms': float(comp.mean()), 'compute_max_ms': float(comp.max())}
+            out = {'cmd_gap_mean_ms': float(gaps.mean()), 'cmd_gap_max_ms': float(gaps.max()),
+                   'compute_mean_ms': float(comp.mean()), 'compute_max_ms': float(comp.max())}
+            ep = self.episode
+            if ep.est_err_mm:                         # 추정 자세 사용 시: 정책이 본 자세의 오차와 지연
+                out.update(est_err_mean_mm=float(np.mean(ep.est_err_mm)), est_err_p95_mm=float(np.percentile(ep.est_err_mm, 95)),
+                           est_err_mean_deg=float(np.mean(ep.est_err_deg)))
+            if ep.est_age_ms:
+                out.update(est_age_mean_ms=float(np.mean(ep.est_age_ms)), est_age_max_ms=float(np.max(ep.est_age_ms)))
+            return out
 
     return ParkPolicyNode()
 
@@ -173,11 +215,13 @@ def main():
     ap.add_argument('--start-yaw-deg', type=float, default=None, help='turn in place to this heading first')
     ap.add_argument('--noise', choices=['ps', 'none'], default='ps')
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--est-topic', default=None, help='use estimated pose from this topic for the policy, e.g. /perceived_pose')
     args = ap.parse_args()
     ep = ParkEpisode(NumpyPolicy(args.policy), 'ABCD'.index(args.slot), args.mode,
-                     None if args.start_yaw_deg is None else math.radians(args.start_yaw_deg), args.noise, args.seed)
+                     None if args.start_yaw_deg is None else math.radians(args.start_yaw_deg), args.noise, args.seed,
+                     use_est=args.est_topic is not None)
     rclpy.init()
-    node = make_node(ep)
+    node = make_node(ep, est_topic=args.est_topic)
     try:
         while rclpy.ok() and ep.result is None:
             rclpy.spin_once(node, timeout_sec=0.1)
