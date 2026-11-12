@@ -1,0 +1,2 @@
+trial,slot,mode,start_x,start_y,start_yaw_deg,finished,success,contact_ms,tapes_touched,lateral_mm,depth_mm,yaw_err_deg,front_back_ok,time_s,detect_rate,parkable,margin_mm,final_x,final_y,final_yaw_deg
+0,D,front,0.2463,0.7457,52.3,True,True,0,,3.3,6.1,0.7,True,23.7,1.0,True,34.9,0.98136,0.36481,0.68

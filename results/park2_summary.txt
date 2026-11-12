@@ -1,0 +1,12 @@
+pa A_rear | trial 0: slot A rear  FAIL contact=0 ms lateral=5.8 mm depth=0.7 mm yaw=5.8 deg time=21.4 s parkable=yes margin=31.6 mm
+pa B_rear | trial 0: slot B rear  OK   contact=0 ms lateral=1.5 mm depth=4.2 mm yaw=0.1 deg time=19.7 s parkable=yes margin=37.3 mm
+pa C_front | trial 0: slot C front OK   contact=0 ms lateral=1.5 mm depth=4.4 mm yaw=1.1 deg time=21.6 s parkable=yes margin=36.3 mm
+pa D_front | trial 0: slot D front OK   contact=0 ms lateral=3.3 mm depth=6.1 mm yaw=0.7 deg time=23.7 s parkable=yes margin=34.9 mm
+pb A_rear | trial 0: slot A rear  FAIL contact=0 ms lateral=6.0 mm depth=0.5 mm yaw=5.4 deg time=21.4 s parkable=yes margin=31.6 mm
+pb B_rear | trial 0: slot B rear  OK   contact=0 ms lateral=1.5 mm depth=4.0 mm yaw=0.2 deg time=19.7 s parkable=yes margin=37.4 mm
+pb C_front | trial 0: slot C front OK   contact=0 ms lateral=1.7 mm depth=4.6 mm yaw=1.2 deg time=21.6 s parkable=yes margin=36.0 mm
+pb D_front | trial 0: slot D front OK   contact=0 ms lateral=3.4 mm depth=6.1 mm yaw=0.5 deg time=23.7 s parkable=yes margin=35.0 mm
+ps A_rear | trial 0: slot A rear  OK   contact=0 ms lateral=4.5 mm depth=0.5 mm yaw=2.3 deg time=21.6 s parkable=yes margin=34.4 mm
+ps B_rear | trial 0: slot B rear  OK   contact=0 ms lateral=1.7 mm depth=2.4 mm yaw=0.5 deg time=19.6 s parkable=yes margin=38.1 mm
+ps C_front | trial 0: slot C front OK   contact=0 ms lateral=0.8 mm depth=3.2 mm yaw=0.6 deg time=21.3 s parkable=yes margin=37.9 mm
+ps D_front | trial 0: slot D front OK   contact=0 ms lateral=1.4 mm depth=3.7 mm yaw=0.2 deg time=23.4 s parkable=yes margin=37.7 mm
