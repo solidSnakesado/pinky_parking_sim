@@ -13,6 +13,8 @@
 따로 만드는 분할마다 다른 --seed를 써서, 자세·조명 샘플이 겹치지 않게 한다.
   다양화 끔 (Q3): python gen_parking_dataset.py --count 2000 --no-randomize --skip-val --out .../parking_seg_v2_norand
     무작위 값은 똑같이 뽑고 적용만 하지 않으므로, 같은 seed면 train 자세·파일 이름이 기존 train과 같다.
+  난이도 단계 (test-OOD): python gen_parking_dataset.py --count 300 --split test --seed 200 --ood light --level 2 --out ...
+    한 요인(light / camera / noise)만 학습 범위 바깥으로 옮긴다. 같은 seed면 모든 세트의 자세가 같다.
 """
 import argparse
 import math
@@ -73,11 +75,37 @@ def quat_mul(a, b):
                      w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2])
 
 
-def small_rotation(rng, max_deg):
+def small_rotation(rng, max_deg, remap=None):
+    """작은 무작위 회전. remap이 있으면 뽑은 각도(°)를 remap(각도)로 바꿔 적용 (난이도 단계용, 뽑는 순서는 같음)."""
     axis = rng.normal(size=3)
     axis /= np.linalg.norm(axis)
-    angle = math.radians(rng.uniform(-max_deg, max_deg))
+    deg = rng.uniform(-max_deg, max_deg)
+    angle = math.radians(remap(deg) if remap else deg)
     return np.array([math.cos(angle / 2), *(axis * math.sin(angle / 2))])
+
+
+# 난이도 단계 (test-OOD). 학습 범위에서 뽑은 값을 학습 범위 바깥 구간으로 옮긴다.
+# 무작위 값을 뽑는 순서·개수는 그대로라서, 같은 seed면 모든 세트의 로봇 자세가 같다.
+OOD_LIGHT = {2: ((0.5, 0.7), (1.3, 1.6)), 3: ((0.3, 0.5), (1.6, 2.0))}   # 조명 배율: 어두운 쪽 / 밝은 쪽
+OOD_CAMERA = {2: ((0.03, 0.06), (3.0, 6.0)), 3: ((0.06, 0.10), (6.0, 10.0))}  # 축별 위치 (m), 회전 각도 (°)
+OOD_NOISE = {2: (5.0, 10.0), 3: (10.0, 20.0)}                               # 센서 노이즈 σ
+
+
+def remap_two_sided(v, lo, hi, low_iv, high_iv):
+    """[lo, hi]의 값을 앞 절반은 low_iv, 뒤 절반은 high_iv 구간으로 선형 이동."""
+    t = (v - lo) / (hi - lo)
+    (a, b), s = (low_iv, t * 2) if t < 0.5 else (high_iv, (t - 0.5) * 2)
+    return a + s * (b - a)
+
+
+def remap_symmetric(v, lim, iv):
+    """[-lim, lim]의 값을 부호는 유지하고 크기만 iv 구간으로 선형 이동."""
+    return math.copysign(iv[0] + abs(v) / lim * (iv[1] - iv[0]), v)
+
+
+def remap_one_sided(v, lo, hi, iv):
+    """[lo, hi]의 값을 iv 구간으로 선형 이동."""
+    return iv[0] + (v - lo) / (hi - lo) * (iv[1] - iv[0])
 
 
 def render_size(width, height, f):
@@ -253,7 +281,12 @@ def main():
                              '(same poses as the randomized run with the same seed)')
     parser.add_argument('--skip-val', action='store_true',
                         help='with --split auto: still sample val images (keeps the random stream) but do not write them')
+    parser.add_argument('--ood', default=None, choices=['light', 'camera', 'noise'],
+                        help='difficulty test: move this factor outside the training range (others unchanged)')
+    parser.add_argument('--level', type=int, default=2, choices=[2, 3], help='difficulty level for --ood')
     args = parser.parse_args()
+    if args.ood and args.no_randomize:
+        parser.error('--ood and --no-randomize cannot be used together')
 
     out = Path(os.path.expanduser(args.out))
     for split in ('train', 'val', 'test'):
@@ -298,10 +331,20 @@ def main():
         # 카메라 흔들림 (거치대가 조금 움직이거나 다시 설치됨): 기본 ±3 cm, ±3°
         # --no-randomize여도 무작위 값은 같은 순서로 뽑는다 (뒤 이미지들의 자세가 기존과 같게 유지됨).
         cam_d = rng.uniform(-args.cam_jitter_m, args.cam_jitter_m, 3)
-        cam_r = small_rotation(rng, args.cam_jitter_deg)
+        rot_remap = None
+        if args.ood == 'camera':             # 난이도: 카메라 흔들림을 학습 범위 바깥으로
+            pos_iv, deg_iv = OOD_CAMERA[args.level]
+            cam_d = np.array([remap_symmetric(d, args.cam_jitter_m, pos_iv) for d in cam_d])
+            rot_remap = lambda deg: remap_symmetric(deg, args.cam_jitter_deg, deg_iv)  # noqa: E731
+        cam_r = small_rotation(rng, args.cam_jitter_deg, rot_remap)
         scale = rng.uniform(0.7, 1.2)
         head_d = rng.uniform(0.7, 1.2)
         head_a = rng.uniform(0.7, 1.3)
+        if args.ood == 'light':              # 난이도: 조명 배율을 학습 범위 바깥으로 (세 값 각각)
+            low_iv, high_iv = OOD_LIGHT[args.level]
+            scale = remap_two_sided(scale, 0.7, 1.2, low_iv, high_iv)
+            head_d = remap_two_sided(head_d, 0.7, 1.2, low_iv, high_iv)
+            head_a = remap_two_sided(head_a, 0.7, 1.3, low_iv, high_iv)
         if args.no_randomize:                # 다양화 끔: 보정한 카메라 자세, 기본 조명
             cam_d, cam_r = np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])
             scale = head_d = head_a = 1.0
@@ -321,7 +364,10 @@ def main():
         contrast = rng.uniform(0.85, 1.15)
         bright = rng.uniform(-20, 20)
         tint = rng.uniform(0.97, 1.03, 3)
-        noise = rng.normal(0, rng.uniform(1, 5), rgb.shape)
+        sigma = rng.uniform(1, 5)
+        if args.ood == 'noise':              # 난이도: 노이즈 σ를 학습 범위 바깥으로 (표준정규 값 개수는 같음)
+            sigma = remap_one_sided(sigma, 1, 5, OOD_NOISE[args.level])
+        noise = rng.normal(0, sigma, rgb.shape)
         if not args.no_randomize:            # 다양화 끔이면 값만 뽑고 적용하지 않음
             rgb = (rgb - 128) * contrast + 128 + bright
             rgb *= tint
