@@ -11,6 +11,8 @@
   train+val : python gen_parking_dataset.py --count 2000                      (val = --val 비율, seed 0)
   test만    : python gen_parking_dataset.py --count 300 --split test --seed 100
 따로 만드는 분할마다 다른 --seed를 써서, 자세·조명 샘플이 겹치지 않게 한다.
+  다양화 끔 (Q3): python gen_parking_dataset.py --count 2000 --no-randomize --skip-val --out .../parking_seg_v2_norand
+    무작위 값은 똑같이 뽑고 적용만 하지 않으므로, 같은 seed면 train 자세·파일 이름이 기존 train과 같다.
 """
 import argparse
 import math
@@ -246,6 +248,11 @@ def main():
     parser.add_argument('--debug', type=int, default=10, help='overlay images to write')
     parser.add_argument('--cam-jitter-m', type=float, default=0.03, help='camera position jitter (+- m)')
     parser.add_argument('--cam-jitter-deg', type=float, default=3.0, help='camera rotation jitter (+- deg)')
+    parser.add_argument('--no-randomize', action='store_true',
+                        help='draw the same random values but do not apply camera/light/image randomization '
+                             '(same poses as the randomized run with the same seed)')
+    parser.add_argument('--skip-val', action='store_true',
+                        help='with --split auto: still sample val images (keeps the random stream) but do not write them')
     args = parser.parse_args()
 
     out = Path(os.path.expanduser(args.out))
@@ -289,13 +296,20 @@ def main():
         data.qpos[3:7] = yaw_quat(yaw)
         data.qpos[wheel_q] = rng.uniform(-math.pi, math.pi, 2)
         # 카메라 흔들림 (거치대가 조금 움직이거나 다시 설치됨): 기본 ±3 cm, ±3°
+        # --no-randomize여도 무작위 값은 같은 순서로 뽑는다 (뒤 이미지들의 자세가 기존과 같게 유지됨).
         cam_d = rng.uniform(-args.cam_jitter_m, args.cam_jitter_m, 3)
-        model.cam_pos[cam_id] = CAM_POS + cam_d
-        model.cam_quat[cam_id] = quat_mul(CAM_QUAT, small_rotation(rng, args.cam_jitter_deg))
+        cam_r = small_rotation(rng, args.cam_jitter_deg)
         scale = rng.uniform(0.7, 1.2)
+        head_d = rng.uniform(0.7, 1.2)
+        head_a = rng.uniform(0.7, 1.3)
+        if args.no_randomize:                # 다양화 끔: 보정한 카메라 자세, 기본 조명
+            cam_d, cam_r = np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])
+            scale = head_d = head_a = 1.0
+        model.cam_pos[cam_id] = CAM_POS + cam_d
+        model.cam_quat[cam_id] = quat_mul(CAM_QUAT, cam_r)
         model.light_diffuse[:] = light0 * scale
-        model.vis.headlight.diffuse[:] = head0[0] * rng.uniform(0.7, 1.2)
-        model.vis.headlight.ambient[:] = head0[1] * rng.uniform(0.7, 1.3)
+        model.vis.headlight.diffuse[:] = head0[0] * head_d
+        model.vis.headlight.ambient[:] = head0[1] * head_a
         mujoco.mj_kinematics(model, data)
         mujoco.mj_camlight(model, data)
 
@@ -304,10 +318,17 @@ def main():
         seg_renderer.update_scene(data, camera='ceiling_camera')
         seg = remap_nearest(seg_renderer.render(), map_x, map_y)
         # 이미지 무작위화: 밝기/대비, 색 틀어짐, 센서 노이즈
-        rgb = (rgb - 128) * rng.uniform(0.85, 1.15) + 128 + rng.uniform(-20, 20)
-        rgb *= rng.uniform(0.97, 1.03, 3)
-        rgb += rng.normal(0, rng.uniform(1, 5), rgb.shape)
+        contrast = rng.uniform(0.85, 1.15)
+        bright = rng.uniform(-20, 20)
+        tint = rng.uniform(0.97, 1.03, 3)
+        noise = rng.normal(0, rng.uniform(1, 5), rgb.shape)
+        if not args.no_randomize:            # 다양화 끔이면 값만 뽑고 적용하지 않음
+            rgb = (rgb - 128) * contrast + 128 + bright
+            rgb *= tint
+            rgb += noise
         image = Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8))
+        if args.skip_val and split == 'val':   # 무작위 값은 이미 뽑았으므로 저장만 건너뜀
+            continue
 
         labels = []
         geom_ids = seg[:, :, 0]
