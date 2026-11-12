@@ -193,6 +193,22 @@ def load_ps_errors(path=REPO / 'results/ps_test.csv'):
     return np.array(rows)
 
 
+# ---------------------------------------------------------------- 관측 (학습 환경과 ROS 2 노드가 같이 씀)
+def make_obs(est, target, slot, mode, twist, prev_action):
+    """관측 17개: 추정 자세 est (x, y, yaw), 목표 자세 target (x, y, yaw), 칸 번호 0~3, 방식 'front'/'rear',
+    오도메트리 속도 twist (v m/s, w rad/s), 직전 행동 prev_action ([-1, 1]^2)."""
+    tx, ty, tyaw = target
+    c, s = math.cos(est[2]), math.sin(est[2])
+    dx, dy = tx - est[0], ty - est[1]
+    e = G.wrap(tyaw - est[2])
+    one_hot = np.zeros(4)
+    one_hot[slot] = 1.0
+    v, w = twist
+    return np.concatenate([[est[0], est[1], c, s, c * dx + s * dy, -s * dx + c * dy, math.cos(e), math.sin(e),
+                            1.0 if mode == 'front' else -1.0], one_hot,
+                           [v / V_MAX, w / W_MAX], prev_action]).astype(np.float32)
+
+
 # ---------------------------------------------------------------- 환경
 class ParkEnv(gym.Env):
     metadata = {'render_modes': []}
@@ -236,17 +252,8 @@ class ParkEnv(gym.Env):
         return -K_DIST * r - K_YAW * weight * abs(G.wrap(self.target[2] - pose[2])) / math.pi
 
     def _obs(self, pose):
-        est = self._measured_pose(pose)
-        tx, ty, tyaw = self.target
-        c, s = math.cos(est[2]), math.sin(est[2])
-        dx, dy = tx - est[0], ty - est[1]
-        e = G.wrap(tyaw - est[2])
-        slot = np.zeros(4)
-        slot[self.slot] = 1.0
-        v, w = self.physics.twist
-        return np.concatenate([[est[0], est[1], c, s, c * dx + s * dy, -s * dx + c * dy, math.cos(e), math.sin(e),
-                                1.0 if self.mode == 'front' else -1.0], slot,
-                               [v / V_MAX, w / W_MAX], self.prev_action]).astype(np.float32)
+        return make_obs(self._measured_pose(pose), self.target, self.slot, self.mode, self.physics.twist,
+                        self.prev_action)
 
     # -- gym 인터페이스
     def reset(self, seed=None, options=None):
