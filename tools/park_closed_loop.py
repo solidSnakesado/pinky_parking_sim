@@ -13,6 +13,8 @@
        (전진 = 전면 주차, 후진 = 후면 주차) -> 정지
   4. 판정은 정답 자세로 한다: 테이프 접촉(로봇 외곽 vs 테이프, 10 ms마다),
      최종 좌우 / 깊이 / 방향 오차, 앞/뒤, 시간.
+     판정 두 가지: 정밀 성공(좌우·깊이 ≤ 20 mm, 방향 ≤ 5°, 접촉 없음) /
+     주차 가능(접촉 없음 + 로봇 외곽이 칸 안에 완전히 들어감, 칸 경계까지의 여유 거리도 기록).
 로봇은 운동학적으로 움직인다(자세를 직접 설정, 바퀴 속도 노이즈 + 오도메트리 오차는
 gen_drive_sequences.py와 같음). 접촉 물리가 없으므로 접촉은 "느끼는" 것이 아니라 판정만 한다.
 
@@ -87,6 +89,22 @@ def touching(x, y, yaw):
         if any(overlaps(p, rect) for p in footprint(x, y, yaw)):
             hit.append(k)
     return hit
+
+
+def slot_rect(slot):
+    """칸 안쪽 범위 (u0, u1, v0, v1) mm: 좌우 = 양쪽 구분선의 안쪽 가장자리, 깊이 = 위 벽 테이프 안쪽 ~ 구분선 끝."""
+    dividers = sorted((t for t in D.TAPES if t[1] == 0 and t[3] == 220), key=lambda t: t[0])   # S1~S5
+    wall = next(t for t in D.TAPES if t[0] == 0 and t[1] == 0 and t[2] == 900)               # P1 (위 벽)
+    left, right = dividers[slot], dividers[slot + 1]
+    return left[0] + left[2], right[0], wall[1] + wall[3], left[1] + left[3]
+
+
+def park_margin(x, y, yaw, slot):
+    """로봇 외곽(몸통 + 바퀴) 꼭짓점에서 칸 경계까지의 최소 거리 mm. 음수 = 칸 밖으로 나감.
+    외곽 상자들은 볼록이고 칸은 축 정렬 사각형이므로 꼭짓점만 보면 정확하다."""
+    u0, u1, v0, v1 = slot_rect(slot)
+    pts = np.vstack(footprint(x, y, yaw))
+    return float(np.min(np.minimum.reduce([pts[:, 0] - u0, u1 - pts[:, 0], pts[:, 1] - v0, v1 - pts[:, 1]])))
 
 
 def sample_start(rng):
@@ -327,11 +345,14 @@ class Overlay:
                fill=grey); y += 18
         d.text((x0, y), L('노란 상자 = 목표 칸', 'yellow box = target slot'), font=self.small, fill=grey); y += 30
         if verdict is not None:
-            ok, reasons = verdict
+            ok, reasons, parkable, margin = verdict
             d.text((x0, y), L('결과: 성공', 'SUCCESS') if ok else L('결과: 실패', 'FAIL'), font=self.big,
                    fill=green if ok else red); y += 34
             for r in reasons:
                 d.text((x0, y), r, font=self.small, fill=red); y += 18
+            d.text((x0, y), L(f'주차 가능: {"예" if parkable else "아니오"} (여유 {margin:.1f} mm)',
+                              f'parkable: {"yes" if parkable else "no"} (margin {margin:.1f} mm)'),
+                   font=self.font, fill=green if parkable else red); y += 22
         return cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGB2BGR)
 
 
@@ -348,7 +369,9 @@ def verdict_of(gt, slot, mode, contact_ms, finished, ko=True):
         reasons.append(f'방향 오차 {yaw:.1f}° > {OK_YAW_DEG:.0f}°' if ko else f'heading {yaw:.1f} deg')
     if not finished:
         reasons.append('시간 초과' if ko else 'time out')
-    return (not reasons, reasons)
+    margin = park_margin(*gt, slot)
+    parkable = finished and not contact_ms and margin >= 0
+    return (not reasons, reasons, parkable, margin)
 
 
 def main():
@@ -475,15 +498,19 @@ def main():
         done = ctrl.name == 'done'
         success = (done and contact_steps == 0 and lateral <= OK_LATERAL_MM and depth <= OK_DEPTH_MM
                    and yaw_err <= OK_YAW_DEG)
+        margin = park_margin(robot.x, robot.y, robot.yaw, slot)    # 주차 가능 기준: 외곽이 칸 안
+        parkable = done and contact_steps == 0 and margin >= 0
         row = dict(trial=k, slot='ABCD'[slot], mode=mode, start_x=round(start[0], 4), start_y=round(start[1], 4),
                    start_yaw_deg=round(math.degrees(start[2]), 1), finished=done, success=success,
                    contact_ms=contact_steps * 10, tapes_touched=' '.join(map(str, sorted(touched))),
                    lateral_mm=round(lateral, 1), depth_mm=round(depth, 1), yaw_err_deg=round(yaw_err, 1),
-                   front_back_ok=yaw_err < 90, time_s=round(t, 1), detect_rate=round(n_meas / max(1, n_frames), 3))
+                   front_back_ok=yaw_err < 90, time_s=round(t, 1), detect_rate=round(n_meas / max(1, n_frames), 3),
+                   parkable=parkable, margin_mm=round(margin, 1), final_x=round(robot.x, 5), final_y=round(robot.y, 5),
+                   final_yaw_deg=round(math.degrees(robot.yaw), 2))
         rows.append(row)
         print(f"trial {k}: slot {row['slot']} {mode:5s} {'OK  ' if success else 'FAIL'} contact={row['contact_ms']} ms "
               f"lateral={row['lateral_mm']} mm depth={row['depth_mm']} mm yaw={row['yaw_err_deg']} deg "
-              f"time={row['time_s']} s", flush=True)
+              f"time={row['time_s']} s parkable={'yes' if parkable else 'no'} margin={row['margin_mm']} mm", flush=True)
 
     with open(out / 'trials.csv', 'w', newline='') as fh:
         wr = csv.DictWriter(fh, fieldnames=list(rows[0]))
@@ -491,7 +518,7 @@ def main():
         wr.writerows(rows)
     n = len(rows)
     ok = sum(r['success'] for r in rows)
-    print(f'method={args.method} success {ok}/{n}  contact-free {sum(r["contact_ms"] == 0 for r in rows)}/{n}  '
+    print(f'method={args.method} success {ok}/{n}  parkable {sum(r["parkable"] for r in rows)}/{n}  contact-free {sum(r["contact_ms"] == 0 for r in rows)}/{n}  '
           f'front/back ok {sum(r["front_back_ok"] for r in rows)}/{n}  -> {out}')
     if viewer is not None:
         viewer.close()
