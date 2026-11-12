@@ -5,6 +5,8 @@
   - ParkEnv를 병렬 프로세스 N개(CPU 코어마다 하나)로 돌리며 PPO(Stable-Baselines3)를 학습
   - 관측값과 보상을 정규화(VecNormalize). 정규화 통계는 모델과 함께 저장
   - 학습 판의 출발 구역: 칸 앞 통로(--lane-start-prob), 칸 앞 진입 구역(--slot-start-prob), 나머지는 입구 통로
+  - --slot-weights A,B,C,D: 학습 판의 칸 비율 (예: 1,1,1,3 -> D 50%). 기본은 균등. 평가 판은 영향 없음
+  - --timeout-penalty P: 학습 판이 시간 초과로 끝나면 벌점 P (기본 0 = 기존과 같음, 예: 10 = 접촉과 같은 벌점)
   - --resume <이름>: 그 실행의 모델과 정규화 통계를 불러와 이어서 학습 (단계 수는 이어서 셈)
   - --learning-rate: 학습률 (이어서 학습할 때 낮추면 후반 성능 하락을 줄이는 데 도움)
   - --checkpoint-every 단계마다 모델과 정규화 통계를 checkpoints/에 저장 (긴 학습이 중간에 멈춰도 남음)
@@ -64,10 +66,11 @@ def wilson(k, n, z=1.96):
     return c - h, c + h
 
 
-def make_env(rank, seed, noise, lane_start_prob, slot_start_prob, slot_rear_prob, mode=None):
+def make_env(rank, seed, noise, lane_start_prob, slot_start_prob, slot_rear_prob, mode=None, slot_weights=None,
+             timeout_penalty=0.0):
     def thunk():
         env = ParkEnv(noise=noise, mode=mode, lane_start_prob=lane_start_prob, slot_start_prob=slot_start_prob,
-                      slot_rear_prob=slot_rear_prob)
+                      slot_rear_prob=slot_rear_prob, slot_weights=slot_weights, timeout_penalty=timeout_penalty)
         env.reset(seed=seed * 1000 + rank)
         return env
     return thunk
@@ -251,6 +254,10 @@ def main():
                          'heading (practise entering and stopping); the rest start in the entrance corridor')
     ap.add_argument('--slot-rear-prob', type=float, default=0.5,
                     help='training only: share of slot-start episodes that are rear-in (practise reversing in)')
+    ap.add_argument('--timeout-penalty', type=float, default=0.0,
+                    help='training only: penalty when an episode times out, ending it as a failure (default 0 = off)')
+    ap.add_argument('--slot-weights', default=None,
+                    help='training only: relative frequency of slots A,B,C,D, e.g. 1,1,1,3 (default: uniform)')
     ap.add_argument('--learning-rate', type=float, default=3e-4, help='PPO learning rate (also applied on --resume)')
     ap.add_argument('--checkpoint-every', type=int, default=1_000_000,
                     help='save model + normalisation to checkpoints/ every N steps (0 = off)')
@@ -277,6 +284,9 @@ def main():
                     help='parking mode of the training and evaluation episodes (front / rear = one mode only)')
     args = ap.parse_args()
     mode = None if args.mode == 'both' else args.mode
+    slot_weights = None if args.slot_weights is None else [float(x) for x in args.slot_weights.split(',')]
+    if slot_weights is not None and (len(slot_weights) != 4 or min(slot_weights) < 0 or sum(slot_weights) <= 0):
+        ap.error('--slot-weights needs 4 non-negative numbers, e.g. 1,1,1,3')
 
     out = REPO / 'runs/rl' / args.name
     if args.eval_only:
@@ -307,7 +317,8 @@ def main():
     torch.set_num_threads(1)        # 작은 신경망: 프로세스당 스레드 1개가 가장 빠름
 
     env = SubprocVecEnv([make_env(i, args.seed, args.noise, args.lane_start_prob, args.slot_start_prob,
-                                  args.slot_rear_prob, mode) for i in range(args.n_envs)])
+                                  args.slot_rear_prob, mode, slot_weights, args.timeout_penalty)
+                         for i in range(args.n_envs)])
     env = VecMonitor(env)
     if args.resume:
         # 이전 실행의 정규화 통계와 모델을 불러와 이어서 학습 (하이퍼파라미터는 저장된 값 그대로)
@@ -333,6 +344,8 @@ def main():
           f'slot {args.slot_start_prob:.0%} (rear {args.slot_rear_prob:.0%}) / '
           f'corridor {1 - args.lane_start_prob - args.slot_start_prob:.0%}, lr {args.learning_rate:g}, '
           f'mode {args.mode}, eval from {args.eval_area}, '
+          f'slots {"uniform" if slot_weights is None else "/".join(f"{x:g}" for x in slot_weights)}, '
+          f'timeout penalty {args.timeout_penalty:g}, '
           f'seed={args.seed}, {start_note} -> {out}', flush=True)
     cb = EvalCallback(out, args.eval_every, args.eval_episodes, args.noise, args.checkpoint_every,
                       args.eval_area, mode)

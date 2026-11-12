@@ -14,6 +14,7 @@
                 'slot' = 칸 앞 대기점~칸 입구 사이, 목표 방향에 가까운 자세 (학습 전용: 진입·정지 연습).
      학습 때는 세 구역을 섞는다 (lane_start_prob, slot_start_prob, 나머지는 corridor).
      방식은 반반이지만, 'slot' 출발은 slot_rear_prob 비율로 후면 (후진 진입을 더 자주 연습)
+     칸은 기본으로 A~D 균등. slot_weights (예: (1, 1, 1, 3))를 주면 그 비율로 뽑는다 (약한 칸을 더 자주 연습)
   2. 0.1초(10 Hz)마다 정책이 (직진, 회전) 속도를 내고, 물리를 10 ms씩 10번 진행한다
   3. 성공, 테이프 접촉, 바닥 판 이탈, 시간 초과 중 하나가 되면 판이 끝난다
 
@@ -29,6 +30,7 @@
   (route_remaining()의 퍼텐셜 차이, FSM과 같은 경유점), 그리고 최종 방향. 방향 항의 가중치는
   대기점 0.15 m 전부터 커져서 대기점과 칸 진입 구간에서 최대가 된다.
   - 매 단계 작은 시간 비용, - 테이프 접촉 / 이탈 (판 종료), + 성공 (판 종료)
+  - 시간 초과 (timeout_penalty > 0일 때만, 판 종료. 기본 0 = 벌점 없이 잘림)
 성공 (park_closed_loop.py와 같은 기준): 테이프 접촉 없음, 좌우·깊이 <= 20 mm,
   방향 <= 5°, 정지
 
@@ -214,7 +216,7 @@ class ParkEnv(gym.Env):
     metadata = {'render_modes': []}
 
     def __init__(self, noise='ps', slot=None, mode=None, scene=SCENE, contact_ends=True, lane_start_prob=0.5,
-                 slot_start_prob=0.0, slot_rear_prob=0.5):
+                 slot_start_prob=0.0, slot_rear_prob=0.5, slot_weights=None, timeout_penalty=0.0):
         from pinky_mujoco.model import Physics
         self.physics = Physics(scene)
         self.base_z = float(self.physics.model.qpos0[2])
@@ -223,6 +225,11 @@ class ParkEnv(gym.Env):
         self.fixed_slot, self.fixed_mode, self.contact_ends = slot, mode, contact_ends
         self.lane_start_prob, self.slot_start_prob = lane_start_prob, slot_start_prob
         self.slot_rear_prob = slot_rear_prob
+        # 칸 뽑기 비율 (None = 균등, 기존과 같은 난수 사용 -> 이전 학습·평가 재현 유지)
+        self.slot_probs = None if slot_weights is None else np.asarray(slot_weights, float) / np.sum(slot_weights)
+        # 시간 초과 벌점 (0 = 기존과 같음: 시간 초과는 잘림(truncated)으로 끝나고 벌점 없음).
+        # > 0이면 시간 초과를 실패로 보고 벌점을 준 뒤 종료(terminated)로 끝낸다 -> 제자리에서 버티는 동작이 손해가 됨
+        self.timeout_penalty = float(timeout_penalty)
         self.max_steps = int(round(TIME_LIMIT_S / CTRL_DT))
         self.action_space = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(17,), dtype=np.float32)
@@ -260,7 +267,10 @@ class ParkEnv(gym.Env):
         super().reset(seed=seed)
         options = options or {}
         self.slot = options.get('slot', self.fixed_slot)
-        self.slot = int(self.np_random.integers(4)) if self.slot is None else int(self.slot)
+        if self.slot is None:
+            self.slot = (int(self.np_random.integers(4)) if self.slot_probs is None else
+                         int(self.np_random.choice(4, p=self.slot_probs)))
+        self.slot = int(self.slot)
         area = options.get('area')
         if area is None:
             r = self.np_random.random()
@@ -316,6 +326,9 @@ class ParkEnv(gym.Env):
         truncated = not terminated and self.steps >= self.max_steps
         if truncated:
             result = 'timeout'
+            if self.timeout_penalty > 0:
+                reward -= self.timeout_penalty
+                terminated, truncated = True, False   # 실패로 끝남: 다음 상태 가치를 더하지 않음
         info = {'result': result, 'lateral_mm': lat, 'depth_mm': depth, 'yaw_deg': yaw, 'contact': contact,
                 'time_s': self.steps * CTRL_DT}
         return self._obs(pose), float(reward), terminated, truncated, info
