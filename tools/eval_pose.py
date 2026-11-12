@@ -6,9 +6,11 @@
   python tools/eval_pose.py --method pa --split test --out results/pa_test.csv
   python tools/eval_pose.py --method pb --split val     (tools/gen_background.py --split val 실행 후)
   python tools/eval_pose.py --method ps --weights runs/segment/runs/ps/yolo11n_seed0/weights/best.pt --split val
+  python tools/eval_pose.py --method pk --weights runs/pose/runs/pk/yolo11n_pk_seed0/weights/best.pt --split val
 
 모든 방법은 바퀴 마스크 + 몸통 마스크를 내고, 자세는 공통 함수 parking_geom.pose_from_masks가
-계산한다. 따라서 방법 간 차이는 마스크를 찾는 방식뿐이다.
+계산한다. 따라서 방법 간 차이는 마스크를 찾는 방식뿐이다. 예외: P-K(pk)는 키포인트에서 자세를 바로 구한다
+(pk_kpt.pose_from_keypoints). used_wheels 열에는 사용한 키포인트 수가 들어간다.
 이미지마다 poses.csv에 기록된 그 이미지의 (보정된) 카메라 자세로 평가한다.
 """
 import argparse
@@ -57,6 +59,12 @@ def get_method(name, data, split, weights=None):
         def detect(img, cam, row):
             return pb_bgsub.detect(img, cam, bgs[row['name']])
         return detect
+    if name == 'pk':
+        if not weights:
+            raise SystemExit('--weights is required for pk')
+        import pk_kpt
+        pk_kpt.load(os.path.expanduser(weights))
+        return lambda img, cam, row: pk_kpt.detect(img, cam)
     raise SystemExit(f'unknown method {name}')
 
 
@@ -78,7 +86,7 @@ def main():
     ap.add_argument('--data', default='~/dev_ws/pinky_parking_sim/datasets/parking_seg_v2')
     ap.add_argument('--split', default='val', choices=['train', 'val', 'test'])
     ap.add_argument('--method', default='pa')
-    ap.add_argument('--weights', default=None, help='model weights for learned methods (ps)')
+    ap.add_argument('--weights', default=None, help='model weights for learned methods (ps, pk)')
     ap.add_argument('--out', default=None, help='per-image result csv (default results/<method>_<split>.csv)')
     ap.add_argument('--debug', type=int, default=10, help='overlay images to write next to the csv')
     args = ap.parse_args()
@@ -97,8 +105,13 @@ def main():
         img = cv2.imread(str(data / 'images' / args.split / f"{r['name']}.jpg"))
         cam = G.Camera.from_row(r)
         t0 = time.perf_counter()
-        wheels, body = detect(img, cam, r)
-        pose = G.pose_from_masks(cam, wheels, body)
+        kp = None
+        if args.method == 'pk':                    # P-K: 마스크 없이 키포인트에서 자세를 바로 구함
+            pose, kp = detect(img, cam, r)
+            wheels, body = [], None
+        else:
+            wheels, body = detect(img, cam, r)
+            pose = G.pose_from_masks(cam, wheels, body)
         t_total += time.perf_counter() - t0
         item = {'name': r['name'], 'kind': r['kind'], 'found': pose is not None, 'n_wheels': len(wheels),
                 'gt_x': r['x_m'], 'gt_y': r['y_m'], 'gt_yaw': r['yaw_rad']}
@@ -114,6 +127,9 @@ def main():
                 vis[w] = (0.5 * vis[w] + (127, 60, 0)).astype(np.uint8)
             if body is not None:
                 vis[body] = (0.5 * vis[body] + (0, 110, 0)).astype(np.uint8)
+            if kp is not None:                     # P-K 점: 앞끝 빨강, 뒤끝 파랑, 왼바퀴 초록, 오른바퀴 노랑
+                for (px, py, c), col in zip(kp, [(0, 0, 255), (255, 0, 0), (0, 200, 0), (0, 200, 255)]):
+                    cv2.circle(vis, (int(round(px)), int(round(py))), 4 if c >= 0.5 else 2, col, -1)
             def arrow(x, y, yaw, color):
                 p = cam.project(np.array([[x, y, 0.03], [x + 0.08 * math.cos(yaw), y + 0.08 * math.sin(yaw), 0.03]]))
                 cv2.arrowedLine(vis, tuple(np.round(p[0]).astype(int)), tuple(np.round(p[1]).astype(int)), color, 2,
@@ -134,7 +150,7 @@ def main():
     print(summary(res, 'all'))
     for kind in sorted({r['kind'] for r in res}):
         print(summary([r for r in res if r['kind'] == kind], kind))
-    for nw in (0, 1, 2):
+    for nw in (() if args.method == 'pk' else (0, 1, 2)):     # P-K는 바퀴 마스크가 없으므로 생략
         sub = [r for r in res if r['n_wheels'] == nw]
         if sub:
             print(summary(sub, f'{nw} wheels'))
