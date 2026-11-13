@@ -15,8 +15,10 @@
 사용법 (pinky_train 가상환경, scipy 필요):
   python tools/calib_from_tape.py --device /dev/video2             # 프레임 10장을 받아 중앙값 영상으로 보정
   python tools/calib_from_tape.py --image results/camera_align/raw_XXXX.png
+  python tools/calib_from_tape.py --dataset datasets/real_test     # 사진마다 다시 보정해 poses.csv 카메라 열 갱신
 """
 import argparse
+import csv
 import json
 import math
 import os
@@ -95,21 +97,10 @@ def grab(device, n):
     return np.median(np.stack(frames[-n:]), axis=0).astype(np.uint8)   # 중앙값 영상 (노이즈 감소)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument('--device', help='camera device (grab frames)')
-    src.add_argument('--image', help='saved raw frame (640x480)')
-    ap.add_argument('--frames', type=int, default=10, help='frames to median when using --device')
-    ap.add_argument('--out', default='config/ceiling_camera_calib.json')
-    ap.add_argument('--canny', type=int, nargs=2, default=[50, 150], help='Canny thresholds')
-    args = ap.parse_args()
-
-    img = grab(args.device, args.frames) if args.device else cv2.imread(args.image)
-    if img is None:
-        raise SystemExit(f'cannot read {args.image}')
+def calibrate(img, canny=(50, 150)):
+    """영상 1장으로 카메라 자세 보정. 반환 (Camera, 시작 잔차, 최종 잔차, 변화 파라미터 p)."""
     img = cv2.resize(img, (G.WIDTH, G.HEIGHT))
-    edges = cv2.Canny(cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (5, 5), 0), *args.canny)
+    edges = cv2.Canny(cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (5, 5), 0), *canny)
     dist = np.minimum(cv2.distanceTransform(255 - edges, cv2.DIST_L2, 5), DIST_CAP).astype(np.float64)
 
     cam0 = G.Camera(CAM_POS0, CAM_QUAT0)
@@ -125,13 +116,79 @@ def main():
     p = np.zeros(6)
     for f_scale in (8.0, 3.0, 1.0):                  # 넓은 범위 -> 좁은 범위로 (지역 최소 회피)
         p = least_squares(residual, p, loss='soft_l1', f_scale=f_scale, x_scale=[0.01] * 3 + [0.005] * 3).x
-    r1 = residual(p)
-    cam = camera_from_params(p, cam0)
+    return camera_from_params(p, cam0), r0, residual(p), p
+
+
+def calibrate_dataset(data, canny):
+    """데이터셋의 사진마다 테이프로 카메라 자세를 다시 구해 poses.csv 카메라 열을 바꾼다.
+    처음 실행할 때 원본을 poses_calib_once.csv로 남기고, 사진별 결과는 calib_per_image.csv에 기록한다.
+    (촬영 중 카메라를 건드려도 평가가 맞게 되도록. 정답 자세는 테이프 기준 실측이라 그대로 둔다.)"""
+    data = Path(data)
+    src = data / 'poses.csv'
+    backup = data / 'poses_calib_once.csv'
+    if not backup.exists():
+        backup.write_text(src.read_text())
+    with open(backup) as fh:
+        rows = list(csv.DictReader(fh))
+        fields = list(rows[0].keys())
+    ref = G.Camera(CAM_POS0, CAM_QUAT0)
+    log = []
+    for r in rows:
+        img = cv2.imread(str(data / 'images' / r['split'] / f"{r['name']}.jpg"))
+        if img is None:
+            raise SystemExit(f"cannot read image for {r['name']}")
+        cam, r0, r1, p = calibrate(img, canny)
+        q = mat_to_quat(cam.R)
+        old = G.Camera([float(r[k]) for k in ('cam_x', 'cam_y', 'cam_z')],
+                       [float(r[k]) for k in ('cam_qw', 'cam_qx', 'cam_qy', 'cam_qz')])
+        # 바닥 기준 변화: 칸 중앙(A칸 u 136, v 120)을 새 카메라로 본 픽셀을 이전 카메라로 되돌린 차이 (mm)
+        x, y = G.mm_to_world(136, 120)
+        w = old.pixels_to_plane(cam.project([[x, y, 0.06]]), 0.06)[0]
+        du, dv = np.subtract(G.world_to_mm(*w), (136, 120))
+        r.update(cam_x=f'{cam.C[0]:.5f}', cam_y=f'{cam.C[1]:.5f}', cam_z=f'{cam.C[2]:.5f}',
+                 cam_qw=f'{q[0]:.6f}', cam_qx=f'{q[1]:.6f}', cam_qy=f'{q[2]:.6f}', cam_qz=f'{q[3]:.6f}')
+        log.append(dict(name=r['name'], residual_before_px=round(float(np.median(r0)), 3),
+                        residual_after_px=round(float(np.median(r1)), 3),
+                        shift_vs_once_du_mm=round(float(du), 1), shift_vs_once_dv_mm=round(float(dv), 1)))
+        print(f"{r['name']:24s} residual px {np.median(r0):5.2f} -> {np.median(r1):4.2f}   "
+              f"floor shift vs single calib (slot A) du={du:+5.1f} dv={dv:+5.1f} mm")
+    with open(src, 'w', newline='') as fh:
+        wr = csv.DictWriter(fh, fieldnames=fields)
+        wr.writeheader()
+        wr.writerows(rows)
+    with open(data / 'calib_per_image.csv', 'w', newline='') as fh:
+        wr = csv.DictWriter(fh, fieldnames=list(log[0].keys()))
+        wr.writeheader()
+        wr.writerows(log)
+    worst = max(l['residual_after_px'] for l in log)
+    print(f'updated {src} ({len(rows)} images, worst residual {worst:.2f} px); original kept in {backup.name}')
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument('--device', help='camera device (grab frames)')
+    src.add_argument('--image', help='saved raw frame (640x480)')
+    src.add_argument('--dataset', help='dataset folder: re-calibrate every image and rewrite camera columns of poses.csv')
+    ap.add_argument('--frames', type=int, default=10, help='frames to median when using --device')
+    ap.add_argument('--out', default='config/ceiling_camera_calib.json')
+    ap.add_argument('--canny', type=int, nargs=2, default=[50, 150], help='Canny thresholds')
+    args = ap.parse_args()
+
+    if args.dataset:
+        calibrate_dataset(os.path.expanduser(args.dataset), args.canny)
+        return
+    img = grab(args.device, args.frames) if args.device else cv2.imread(args.image)
+    if img is None:
+        raise SystemExit(f'cannot read {args.image}')
+    img = cv2.resize(img, (G.WIDTH, G.HEIGHT))
+    cam, r0, r1, p = calibrate(img, args.canny)
+    cam0 = G.Camera(CAM_POS0, CAM_QUAT0)
     q = mat_to_quat(cam.R)
     # 이전 보정값 대비 변화: 위치 (cm), 회전 각도 (°)
     dpos_cm = np.linalg.norm(p[:3]) * 100
     drot_deg = math.degrees(np.linalg.norm(p[3:]))
-    print(f'points={len(world)}  residual px median {np.median(r0):.2f} -> {np.median(r1):.2f}  '
+    print(f'points={len(r1)}  residual px median {np.median(r0):.2f} -> {np.median(r1):.2f}  '
           f'p90 {np.percentile(r0, 90):.2f} -> {np.percentile(r1, 90):.2f}')
     print(f'change vs previous calib: position {dpos_cm:.2f} cm, rotation {drot_deg:.2f} deg '
           f'(training jitter range 3 cm / 3 deg)')
