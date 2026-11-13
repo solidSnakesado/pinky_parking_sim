@@ -34,6 +34,10 @@ WHEEL_Y = 0.0406
 WHEEL_Z = 0.030          # 바퀴 픽셀을 평면으로 되돌릴 때 쓰는 높이
 BODY_Z = 0.100           # 몸통 픽셀을 평면으로 되돌릴 때 쓰는 높이 (윗면)
 WHEEL_Y_VISIBLE = 0.047  # 보이는 타이어 부분(바깥쪽)의 중심, val 분할에서 측정
+PAIR_SEP_MIN, PAIR_SEP_MAX = 0.065, 0.125   # 검출된 두 바퀴 중심 간격 허용 범위 (실제 약 0.094 m)
+YAW_REFINE_DEG = 20.0    # 바퀴 2개일 때 축 방향을 몸통 모양으로 미세 조정하는 범위
+YAW_REFINE_GAIN = 0.03   # 축 방향에서 벗어난 각도는 겹침(IoU)이 이만큼 더 좋아야 채택
+last_fb_margin = None    # 마지막 바퀴 2개 계산에서 앞/뒤 두 방향의 겹침 점수 차이 (작으면 앞/뒤 불확실)
 # 로봇 좌표계(x 앞, y 왼쪽, z 위)의 단순한 핑키 3D 모델: 상자 (x0, x1, y0, y1, z0, z1)
 ROBOT_BOXES = [
     (-0.076, 0.042, -0.042, 0.042, 0.005, 0.100),     # 몸통
@@ -142,7 +146,8 @@ def pose_from_masks(camera, wheel_masks, body_mask, min_wheel_px=15, min_body_px
     규칙 (모든 인식 방법 공통):
       - 바퀴 2개: base_link = 두 바퀴 중심의 중점, 방향은 바퀴 축에 수직.
         앞/뒤: 두 방향 각각의 로봇 3D 모델 투영을 검출된 로봇 픽셀과 비교해 더 잘 겹치는 쪽을 씀
-        (카메라가 비스듬히 보는 시점과 시차를 처리).
+        (카메라가 비스듬히 보는 시점과 시차를 처리). 축 방향 ±YAW_REFINE_DEG도 같은 점수로 미세 조정.
+        두 바퀴 간격이 PAIR_SEP_MIN~MAX 밖이면 잘못 잡은 쌍으로 보고 큰 바퀴 하나로 처리.
       - 바퀴 1개: 왼쪽 바퀴인지 오른쪽 바퀴인지, 방향이 어느 쪽인지 모름. 5°마다 후보 방향을
         같은 방식으로 점수 매겨 가장 좋은 것을 씀.
       - 바퀴 없음: 정보 부족 -> None.
@@ -160,11 +165,30 @@ def pose_from_masks(camera, wheel_masks, body_mask, min_wheel_px=15, min_body_px
         centres.append(camera.pixels_to_plane(np.column_stack([xs, ys]), WHEEL_Z).mean(0))
     if len(centres) == 2:
         W1, W2 = centres
-        M = (W1 + W2) / 2
-        axle = W2 - W1
-        yaw0 = math.atan2(axle[0], -axle[1])          # 축에 수직인 두 방향 중 하나
-        best = max(((iou(silhouette(camera, M[0], M[1], yaw), robot), yaw) for yaw in (yaw0, yaw0 + math.pi)))
-        return M[0], M[1], wrap(best[1]), 2
+        sep = np.linalg.norm(W2 - W1)
+        if PAIR_SEP_MIN <= sep <= PAIR_SEP_MAX:
+            M = (W1 + W2) / 2
+            axle = W2 - W1
+            yaw0 = math.atan2(axle[0], -axle[1])          # 축에 수직인 두 방향 중 하나
+            scores = []                                    # (iou, yaw) : 앞/뒤 두 방향 x 축 방향 미세 조정
+            for base in (yaw0, yaw0 + math.pi):
+                s0 = iou(silhouette(camera, M[0], M[1], base), robot)
+                cand = (s0, base)
+                for d in np.radians(np.arange(-YAW_REFINE_DEG, YAW_REFINE_DEG + 0.1, 2.0)):
+                    if d == 0:
+                        continue
+                    sc = iou(silhouette(camera, M[0], M[1], base + d), robot)
+                    if sc > cand[0] and sc > s0 + YAW_REFINE_GAIN:
+                        cand = (sc, base + d)
+                scores.append(cand)
+            scores.sort(reverse=True)
+            global last_fb_margin
+            last_fb_margin = scores[0][0] - scores[1][0]
+            return M[0], M[1], wrap(scores[0][1]), 2
+        # 두 바퀴 간격이 실제와 크게 다름 (한 바퀴가 둘로 쪼개졌거나, 가려진 바퀴의 일부만 잡힘)
+        # -> 더 크게 보이는 바퀴 하나만 써서 아래 바퀴 1개 방식으로 처리
+        sizes = [m.sum() for m in wheels[:2]]
+        centres = [centres[int(np.argmax(sizes))]]
     W = centres[0]
     best = None
     for side in (+1, -1):
