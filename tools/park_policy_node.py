@@ -35,6 +35,7 @@ import math
 import os
 import sys
 import time
+from datetime import datetime
 
 import numpy as np
 
@@ -47,6 +48,8 @@ from export_policy import NumpyPolicy  # noqa: E402
 
 TURN_TOL = math.radians(2.0)       # 출발 방향 맞추기 허용 오차
 TURN_SETTLE_W = 0.05               # 회전이 멈췄다고 볼 각속도 (rad/s)
+GAP_LOG_S = 0.1                    # 자세 메시지 사이 실제 시간 간격이 이보다 크면 끊김으로 기록 (초)
+BURST_S = 0.005                    # 끊김 뒤 이보다 짧은 간격으로 몰려 온 메시지 = 밀렸다가 한꺼번에 처리된 것
 STALE_S = 0.2                      # 추정 자세가 이보다 오래되면 정지 (오래된 자세 감시, 초)
 
 
@@ -174,6 +177,13 @@ def make_node(episode, name='park_policy', est_topic=None):
             if est_topic:
                 self.create_subscription(PoseStamped, est_topic, self.on_est, 10)
             self.compute_ms, self.pub_wall = [], []
+            # 끊김 기록: 자세 메시지 사이 실제 시간 간격이 GAP_LOG_S보다 큰 경우마다
+            #   wall = 실제 시간 간격, sim = 같은 두 메시지의 시뮬 시간 간격, at = 판 시작(첫 자세) 후 시뮬 시간,
+            #   phase = 그때 단계, burst = 끊김 뒤 몰려 온 메시지 수
+            # 해석: sim ~20 ms + burst 0 -> 브리지(시뮬)가 멈춤, sim ~20 ms + burst 많음 -> 이 노드 쪽이 멈췄다가
+            #       밀린 메시지를 한꺼번에 처리 (그동안 시뮬은 옛 명령으로 진행), sim ~= wall -> 메시지가 버려짐
+            self.gap_events = []
+            self.prev_wall = self.prev_t = self.first_t = None
 
         @staticmethod
         def _pose(msg):
@@ -196,12 +206,30 @@ def make_node(episode, name='park_policy', est_topic=None):
             t, pose = self._pose(msg)
             if self.first_pose is None:
                 self.first_pose = pose
+            self._log_gap(time.monotonic(), t)
             v, w = self.episode.on_state(t, pose, self.twist, self.est, self.est_t)
             cmd = Twist()
             cmd.linear.x, cmd.angular.z = float(v), float(w)
             self.pub.publish(cmd)
             self.compute_ms.append((time.perf_counter() - c0) * 1000)
             self.pub_wall.append(time.monotonic())
+
+        def _log_gap(self, wall, t):
+            """자세 메시지 간격 확인 -> 끊김 기록, 끊김 직후 몰려 온 메시지 수 세기."""
+            if self.prev_wall is not None:
+                gap = wall - self.prev_wall
+                if gap > GAP_LOG_S:
+                    self.gap_events.append({'clock': time.time(), 'wall_ms': gap * 1000, 'sim_ms': (t - self.prev_t) * 1000,
+                                            'at_s': t - self.first_t, 'phase': self.episode.phase, 'burst': 0,
+                                            'open': True})
+                elif self.gap_events and self.gap_events[-1]['open']:
+                    if gap < BURST_S:
+                        self.gap_events[-1]['burst'] += 1
+                    else:
+                        self.gap_events[-1]['open'] = False
+            else:
+                self.first_t = t
+            self.prev_wall, self.prev_t = wall, t
 
         def stop(self):
             for _ in range(3):
@@ -219,6 +247,11 @@ def make_node(episode, name='park_policy', est_topic=None):
                            est_err_mean_deg=float(np.mean(ep.est_err_deg)))
             if ep.est_age_ms:
                 out.update(est_age_mean_ms=float(np.mean(ep.est_age_ms)), est_age_max_ms=float(np.max(ep.est_age_ms)))
+            out['n_gaps'] = len(self.gap_events)
+            if self.gap_events:                       # 예: w340/s20/b16@12.3s:policy[17:40:01.234] ([] = 실제 시각)
+                out['gap_events'] = ';'.join(f"w{e['wall_ms']:.0f}/s{e['sim_ms']:.0f}/b{e['burst']}@{e['at_s']:.1f}s:{e['phase']}"
+                                             f"[{datetime.fromtimestamp(e['clock']).strftime('%H:%M:%S.%f')[:-3]}]"
+                                             for e in self.gap_events)
             if ep.use_est:                            # 오래된 자세 감시 결과
                 out.update(stale_steps=ep.stale_steps, stale_hits=ep.stale_hits, stale_max_ms=ep.stale_max_ms)
             return out

@@ -39,7 +39,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import traceback
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +57,48 @@ from park_policy_node import ParkEpisode, make_node  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 SPAWN_Z = 0.030
+STALL_S = 0.15          # 자세 메시지가 이 시간 넘게 안 오면 끊김으로 보고 주 스레드 위치를 기록 (초)
+STALL_SAMPLES = 12      # 끊김 한 번에 기록할 표본 수 (20 ms 간격)
+
+
+def start_stall_watch(node, ep, state, path):
+    """끊김 원인 조사용 감시 스레드. (정지 신호, 스레드)를 돌려준다. 주행 로직에는 영향 없음.
+
+    정책 노드가 자세(/ground_truth)를 STALL_S 넘게 받지 못하는 동안 20 ms마다 한 줄씩 path에 기록한다.
+      no pose   : 마지막 자세를 받은 뒤 지난 시간
+      loop      : 주 루프(spin_once 반복)가 마지막으로 돈 뒤 지난 시간, 지금까지 돈 횟수
+                  -> 작으면(60 ms 이하) 주 루프는 돌고 있는데 메시지만 안 온 것 (수신 쪽 통신)
+                  -> 크면 주 스레드가 어딘가에 멈춰 있는 것 (아래 호출 위치가 그 자리)
+      tick late : 이 감시 스레드 자신이 늦게 깬 시간 -> 크면 프로세스 전체가 멈춘 것 (스케줄링, GIL)
+      est_t     : 마지막으로 받은 추정 자세의 시뮬 시각 -> 끊김 중에 바뀌면 다른 토픽은 들어오고 있는 것
+      그 아래   : 주 스레드가 실행 중인 Python 호출 위치 (마지막 5단계)
+    """
+    main_id = threading.main_thread().ident
+    stop = threading.Event()
+
+    def watch():
+        last_tick, n = time.monotonic(), 0
+        while not stop.wait(0.02):
+            now = time.monotonic()
+            late = (now - last_tick - 0.02) * 1000
+            last_tick = now
+            last_pose = node.pub_wall[-1] if node.pub_wall else None
+            if last_pose is None or ep.result is not None or now - last_pose < STALL_S:
+                n = 0
+                continue
+            if n >= STALL_SAMPLES:
+                continue
+            n += 1
+            frame = sys._current_frames().get(main_id)
+            stack = ''.join(traceback.format_stack(frame)[-5:]) if frame is not None else '  (no frame)\n'
+            with open(path, 'a') as f:
+                f.write(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} sample {n}: no pose {(now - last_pose) * 1000:.0f} ms"
+                        f" | loop {(now - state['loop_t']) * 1000:.0f} ms ago (n {state['loops']})"
+                        f" | tick late {late:.0f} ms | est_t {node.est_t} | phase {ep.phase}\n{stack}\n")
+
+    th = threading.Thread(target=watch, daemon=True)
+    th.start()
+    return stop, th
 
 
 def start_pose(k, seed0):
@@ -114,8 +159,13 @@ def run_ros(policy, slot, mode, start, noise, seed, k, args, tmp, logdir):
     node = make_node(ep, name=f'park_policy_{k}', est_topic='/perceived_pose' if use_est else None)
     t_start = time.monotonic()
     info, timing = None, {}
+    stall_path = logdir / f'stall_{k:03d}.log'            # 끊김 조사 기록 (끊김이 있던 판에만 생김)
+    stall_path.unlink(missing_ok=True)
+    state = {'loop_t': time.monotonic(), 'loops': 0}
+    stall_stop, stall_th = start_stall_watch(node, ep, state, stall_path)
     try:
         while ep.result is None:
+            state['loop_t'], state['loops'] = time.monotonic(), state['loops'] + 1
             rclpy.spin_once(node, timeout_sec=0.05)
             if proc.poll() is not None:
                 info = {'result': 'bridge_exit'}
@@ -131,6 +181,10 @@ def run_ros(policy, slot, mode, start, noise, seed, k, args, tmp, logdir):
         if node.first_pose is not None:
             timing['spawn_error_mm'] = math.hypot(node.first_pose[0] - start[0], node.first_pose[1] - start[1]) * 1000
     finally:
+        stall_stop.set()
+        stall_th.join(timeout=1.0)
+        if stall_path.is_file():
+            timing['stall_log'] = stall_path.name
         node.destroy_node()
         for p_, lg in helpers + [(proc, log)]:            # 인식·카메라 노드 먼저, 브리지 마지막
             if p_.poll() is None:
@@ -217,6 +271,10 @@ def main():
             print(f"  [{k + 1:4d}/{args.episodes}] {'ABCD'[slot]} {mode:5s} -> {row['result']:12s} "
                   f"t={row['time_s'] if row['time_s'] == row['time_s'] else 0:5.1f} s | success {n_ok}/{len(rows)} "
                   f"| {el / 60:.1f} min, ~{eta / 60:.1f} min left{extra}", flush=True)
+            if timing.get('gap_events'):                     # 끊김 기록 (실제/시뮬 간격, 몰려 온 수, 시점, 단계)
+                print(f"           gaps > 100 ms: {timing['gap_events']}", flush=True)
+            if timing.get('stall_log'):
+                print(f"           stall log: ros_logs/{timing['stall_log']}", flush=True)
             with open(out, 'w', newline='') as f:                # 판마다 저장 (중간에 멈춰도 남음)
                 keys = sorted({k2 for r in rows for k2 in r}, key=lambda c: list(rows[0]).index(c)
                               if c in rows[0] else 999)
