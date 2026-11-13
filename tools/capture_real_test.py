@@ -232,9 +232,10 @@ def pose_ok(pose, cam):
 
 
 def make_plan(cam, seed=600, count=40):
-    """40자세: 칸 안 16, 칸 앞 접근 12, 입구 통로 6, 가로 통로 6 (count=20이면 절반: 8 / 6 / 3 / 3).
-    각각 테이프 여유·화면 안·측정 가능 확인."""
-    half = count == 20
+    """40자세: 칸 안 16, 칸 앞 접근 12, 입구 통로 6, 가로 통로 6. 각각 테이프 여유·화면 안·측정 가능 확인.
+    순서는 앞 20개(1차)와 뒤 20개(2차)가 각각 같은 비율(8 / 6 / 3 / 3)이 되게 정렬한다.
+    count=20이면 1차 20개만 쓰고, 나중에 count=40으로 다시 실행하면 같은 번호로 2차 20개를 이어서 찍는다."""
+    half = False
     rng = np.random.default_rng(seed)
     plan = []
 
@@ -263,7 +264,17 @@ def make_plan(cam, seed=600, count=40):
         3 if half else 6)
     add('free', lambda: (rng.uniform(600, 900), rng.uniform(740, 920), rng.uniform(-math.pi, math.pi)),
         3 if half else 6)
-    return plan
+    # 1차 / 2차 나누기: 칸 안은 칸·모드마다 2개 중 첫째가 1차, 나머지 종류는 앞 절반이 1차
+    first, second = [], []
+    for kind in ('parked', 'approach', 'entrance', 'free'):
+        items = [p for p in plan if p['kind'] == kind]
+        if kind == 'parked':
+            first += items[0::2]
+            second += items[1::2]
+        else:
+            first += items[:len(items) // 2]
+            second += items[len(items) // 2:]
+    return (first + second)[:count]
 
 
 def describe(meas, pose):
@@ -312,7 +323,8 @@ def main():
     ap.add_argument('--calib', default='config/ceiling_camera_calib.json')
     ap.add_argument('--out', default='~/dev_ws/pinky_parking_sim/datasets/real_test')
     ap.add_argument('--seed', type=int, default=600, help='seed for the target pose list')
-    ap.add_argument('--count', type=int, default=40, choices=[20, 40], help='number of poses')
+    ap.add_argument('--count', type=int, default=40, choices=[20, 40],
+                    help='poses to use: 20 = first batch, 40 = both batches (same numbering)')
     ap.add_argument('--plan-only', action='store_true', help='print the pose list and measurement guide, then exit')
     args = ap.parse_args()
 
@@ -331,10 +343,9 @@ def main():
     (out / 'images' / 'test').mkdir(parents=True, exist_ok=True)
     (out / 'background' / 'test').mkdir(parents=True, exist_ok=True)
     sess_path = out / 'session.json'
-    sess = (json.load(open(sess_path)) if sess_path.exists()
-            else dict(seed=args.seed, count=args.count, poses={}, shots=[], bg={}))
-    if sess['seed'] != args.seed or sess.get('count', 40) != args.count:
-        raise SystemExit(f'session in {out} used seed {sess["seed"]} count {sess.get("count", 40)}')
+    sess = json.load(open(sess_path)) if sess_path.exists() else dict(seed=args.seed, poses={}, shots=[], bg={})
+    if sess['seed'] != args.seed:                    # count는 20 -> 40으로 늘려도 앞 20개 번호가 같음
+        raise SystemExit(f'session in {out} used seed {sess["seed"]}')
 
     def save_session():
         json.dump(sess, open(sess_path, 'w'), indent=1)
