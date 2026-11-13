@@ -111,16 +111,20 @@ def main():
             wheels, body = [], None
         else:
             wheels, body = detect(img, cam, r)
+            G.last_fb_margin = None
             pose = G.pose_from_masks(cam, wheels, body)
         t_total += time.perf_counter() - t0
         item = {'name': r['name'], 'kind': r['kind'], 'found': pose is not None, 'n_wheels': len(wheels),
-                'gt_x': r['x_m'], 'gt_y': r['y_m'], 'gt_yaw': r['yaw_rad']}
+                'gt_x': r['x_m'], 'gt_y': r['y_m'], 'gt_yaw': r['yaw_rad'],
+                'fb_margin': '' if args.method == 'pk' or G.last_fb_margin is None else round(G.last_fb_margin, 4)}
         if pose is not None:
             x, y, yaw, nw = pose
             item.update(est_x=x, est_y=y, est_yaw=yaw, used_wheels=nw,
                         pos_err_mm=1000 * math.hypot(x - r['x_m'], y - r['y_m']),
                         yaw_err_deg=abs(math.degrees(G.wrap(yaw - r['yaw_rad']))))
         res.append(item)
+        if (i + 1) % 10 == 0 or i + 1 == len(rows):
+            print(f'  {i + 1}/{len(rows)}', flush=True)
         if i < args.debug:
             vis = img.copy()
             for w in wheels:
@@ -139,7 +143,7 @@ def main():
                 arrow(pose[0], pose[1], pose[2], (0, 0, 255))              # 추정: 빨강
             cv2.imwrite(str(dbg / f"{r['name']}.jpg"), vis)
     keys = ['name', 'kind', 'found', 'n_wheels', 'used_wheels', 'gt_x', 'gt_y', 'gt_yaw', 'est_x', 'est_y',
-            'est_yaw', 'pos_err_mm', 'yaw_err_deg']
+            'est_yaw', 'pos_err_mm', 'yaw_err_deg', 'fb_margin']
     with open(out, 'w', newline='') as fh:
         w = csv.DictWriter(fh, fieldnames=keys)
         w.writeheader()
