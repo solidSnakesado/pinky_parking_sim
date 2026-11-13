@@ -13,6 +13,11 @@
          영상 시각과 /odom 시각은 같은 시계여야 함 (시뮬: 둘 다 시뮬 시간, 실물: PC와 핑키 시계 동기화 필요)
   필터가 시작된 뒤(첫 측정 3개 이후) /odom이 올 때마다(시뮬 50 Hz) 오도메트리로 예측한 추정 자세를 발행한다.
   영상(10 Hz) 사이에도 자세가 갱신되므로 정책이 보는 자세가 오래되지 않는다. 시각 도장 = 그 /odom 시각.
+  스레드: 인식(영상 -> 자세)은 별도 작업 스레드에서 가장 최근 영상 1장만 처리한다. ROS 콜백(영상 받기,
+         /odom 예측·발행)은 인식을 기다리지 않으므로, 인식이 영상 간격보다 오래 걸려도 자세 발행이 밀리지 않는다
+         (밀리면 옛 /odom 시각이 붙은 오래된 자세가 나가고, 정책 노드의 오래된 자세 감시에 걸림).
+         처리 중에 새 영상이 오면 기다리던 영상은 버리고 새 영상으로 바꾼다 (버린 수 = dropped).
+         필터·오도메트리 기록은 잠금(lock)으로 보호하고, 무거운 인식은 잠금 밖에서 한다.
   종료(SIGINT) 시 처리 시간·검출률 통계를 출력하고, --stats-file이 있으면 JSON으로 저장.
 
 토픽
@@ -31,6 +36,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from collections import deque
 
@@ -111,15 +117,23 @@ def main():
             self.odom_t, self.odom = deque(maxlen=300), deque(maxlen=300)    # 최근 오도메트리 (약 6초)
             self.compute_ms, self.n_frames, self.n_meas, self.n_pub = [], 0, 0, 0
             self.comp_lag_ms, self.n_comp_miss = [], 0
+            self.n_dropped = 0                         # 처리하기 전에 새 영상으로 바뀌어 버린 영상 수
+            self.lock = threading.Lock()               # 필터·오도메트리 기록 보호 (콜백 <-> 작업 스레드)
+            self.pending = None                        # 작업 스레드가 처리할 가장 최근 영상
+            self.cv = threading.Condition()            # 새 영상 알림
+            self.running = True
+            self.worker = threading.Thread(target=self.work, daemon=True)
+            self.worker.start()
 
         def on_odom(self, msg):
             p = msg.pose.pose
             o = (p.position.x, p.position.y, yaw_of(p.orientation))
-            self.filt.predict(o)
-            self.odom_t.append(stamp_s(msg.header.stamp))
-            self.odom.append(o)
-            self.got_odom = True
-            self.publish(msg.header.stamp)
+            with self.lock:
+                self.filt.predict(o)
+                self.odom_t.append(stamp_s(msg.header.stamp))
+                self.odom.append(o)
+                self.got_odom = True
+                self.publish(msg.header.stamp)
 
         def publish(self, stamp):
             """필터의 현재 추정 자세 발행 (필터 시작 전에는 발행하지 않음)."""
@@ -150,19 +164,42 @@ def main():
             return shift_by_odom(m, self.odom[i], self.odom[-1]), t_now
 
         def on_image(self, msg):
+            """영상은 받기만 하고 작업 스레드에 넘긴다 (기다리던 영상이 있으면 새 영상으로 바꿈)."""
             if not self.got_odom:                       # 필터 예측에 오도메트리가 필요
                 return
-            c0 = time.perf_counter()
-            img = image_to_bgr(msg)
-            wheels, body = detect(img, cam, None)
-            pose = G.pose_from_masks(cam, wheels, body)
-            self.n_frames += 1
-            self.n_meas += pose is not None
-            t_ref = stamp_s(msg.header.stamp)
-            if pose is not None:
-                pose, _ = self.compensate(pose[:3], t_ref)
-            self.filt.update(pose)
-            self.compute_ms.append((time.perf_counter() - c0) * 1000)
+            with self.cv:
+                if self.pending is not None:
+                    self.n_dropped += 1
+                self.pending = msg
+                self.cv.notify()
+
+        def work(self):
+            """작업 스레드: 가장 최근 영상 -> 인식 (잠금 밖) -> 지연 보정 + 필터 보정 (잠금 안)."""
+            while True:
+                with self.cv:
+                    while self.pending is None and self.running:
+                        self.cv.wait(timeout=0.5)
+                    if not self.running:
+                        return
+                    msg, self.pending = self.pending, None
+                c0 = time.perf_counter()
+                img = image_to_bgr(msg)
+                wheels, body = detect(img, cam, None)
+                pose = G.pose_from_masks(cam, wheels, body)
+                t_ref = stamp_s(msg.header.stamp)
+                with self.lock:
+                    self.n_frames += 1
+                    self.n_meas += pose is not None
+                    if pose is not None:
+                        pose, _ = self.compensate(pose[:3], t_ref)
+                    self.filt.update(pose)
+                    self.compute_ms.append((time.perf_counter() - c0) * 1000)
+
+        def stop_worker(self):
+            with self.cv:
+                self.running = False
+                self.cv.notify()
+            self.worker.join(timeout=2.0)
 
         def stats(self):
             c = np.array(self.compute_ms or [0.0])
@@ -170,7 +207,7 @@ def main():
                     'detect_rate': self.n_meas / max(1, self.n_frames),
                     'perc_compute_mean_ms': float(c.mean()), 'perc_compute_max_ms': float(c.max()),
                     'comp_lag_mean_ms': float(np.mean(self.comp_lag_ms)) if self.comp_lag_ms else float('nan'),
-                    'comp_miss': self.n_comp_miss}
+                    'comp_miss': self.n_comp_miss, 'dropped': self.n_dropped}
 
     rclpy.init()
     node = PosePerceptionNode()
@@ -179,11 +216,12 @@ def main():
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        node.stop_worker()
         st = node.stats()
         print(f"pose_perception ({st['method']}): {st['frames']} frames, detected {st['detect_rate']:.1%}, "
               f"published {st['published']}, compute mean {st['perc_compute_mean_ms']:.1f} ms "
               f"(max {st['perc_compute_max_ms']:.1f} ms), latency compensated {st['comp_lag_mean_ms']:.0f} ms "
-              f"(missed {st['comp_miss']})", flush=True)
+              f"(missed {st['comp_miss']}), dropped {st['dropped']}", flush=True)
         if args.stats_file:
             with open(args.stats_file, 'w') as f:
                 json.dump(st, f)
