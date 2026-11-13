@@ -1,0 +1,8 @@
+pa | method=pa split=test images=39 time/img=9.3 ms all n= 39 found=100.0% pos mm mean= 418.2 median= 433.6 p95= 871.8 yaw deg mean= 71.1 median= 61.5 front/back ok= 61.5%
+pb | method=pb split=test images=39 time/img=28.1 ms all n= 39 found= 66.7% pos mm mean= 118.5 median= 15.2 p95= 743.0 yaw deg mean= 37.0 median= 5.8 front/back ok= 76.9%
+ps0 | method=ps split=test images=39 time/img=13.4 ms all n= 39 found=100.0% pos mm mean= 93.8 median= 12.6 p95= 581.9 yaw deg mean= 23.5 median= 4.2 front/back ok= 89.7%
+ps1 | method=ps split=test images=39 time/img=15.3 ms all n= 39 found=100.0% pos mm mean= 49.6 median= 11.2 p95= 270.0 yaw deg mean= 28.3 median= 4.6 front/back ok= 87.2%
+ps2 | method=ps split=test images=39 time/img=16.1 ms all n= 39 found=100.0% pos mm mean= 19.8 median= 11.5 p95= 50.1 yaw deg mean= 26.3 median= 4.3 front/back ok= 84.6%
+pk0 | method=pk split=test images=39 time/img=5.4 ms all n= 39 found=100.0% pos mm mean= 15.1 median= 11.8 p95= 29.2 yaw deg mean= 54.0 median= 6.1 front/back ok= 71.8%
+pk1 | method=pk split=test images=39 time/img=5.5 ms all n= 39 found=100.0% pos mm mean= 11.3 median= 10.4 p95= 25.2 yaw deg mean= 31.8 median= 3.0 front/back ok= 84.6%
+pk2 | method=pk split=test images=39 time/img=5.6 ms all n= 39 found=100.0% pos mm mean= 11.2 median= 10.8 p95= 24.8 yaw deg mean= 25.9 median= 3.6 front/back ok= 87.2%

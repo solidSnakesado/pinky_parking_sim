@@ -28,3 +28,13 @@ name,pose_index,light,corner_1,line_1,dist_1_mm,corner_2,line_2,dist_2_mm,corner
 017_free_L1,17,1,FR,L4 top edge (v=981),79.0,FL,L4 top edge (v=981),78.0,RR,L5 right edge (u=559.5),46.0
 018_free_L1,18,1,FR,L3 bottom edge (v=680),43.0,FL,L3 bottom edge (v=680),46.0,RL,L5 right edge (u=559.5),110.0
 019_free_L1,19,1,RR,L3 bottom edge (v=680),26.0,RL,L3 bottom edge (v=680),73.0,RR,L5 right edge (u=559.5),96.0
+020_parked_L1,20,1,FR,P1 bottom edge (v=19),53.0,FL,P1 bottom edge (v=19),62.0,RR,S2 left edge (u=231.5),48.0
+021_parked_L1,21,1,RR,P1 bottom edge (v=19),54.0,RL,P1 bottom edge (v=19),60.0,RL,S3 left edge (u=440.5),49.0
+022_parked_L1,22,1,FL,P1 bottom edge (v=19),50.0,FR,P1 bottom edge (v=19),54.0,RL,S3 right edge (u=459.5),52.0
+023_parked_L1,23,1,RL,P1 bottom edge (v=19),48.0,RR,P1 bottom edge (v=19),53.0,RR,S4 right edge (u=668.5),43.0
+024_approach_L1,24,1,RL,P2 right edge (u=19),35.0,RR,P2 right edge (u=19),48.0,RR,P4 top edge (v=581),194.0
+025_approach_L1,25,1,RL,P1 bottom edge (v=19),203.0,RR,P1 bottom edge (v=19),224.0,RL,S5 left edge (u=858.5),73.0
+026_approach_L1,26,1,RL,P1 bottom edge (v=19),185.0,RR,P1 bottom edge (v=19),208.0,RL,S3 left edge (u=440.5),102.0
+027_entrance_L1,27,1,FR,L4 top edge (v=981),195.0,FL,L4 top edge (v=981),210.0,RR,L1 right edge (u=195),152.0
+028_entrance_L1,28,1,RL,L5 left edge (u=540.5),77.0,RR,L5 left edge (u=540.5),107.0,RL,L4 top edge (v=981),122.0
+029_free_L1,29,1,FR,L3 bottom edge (v=680),148.0,FL,L3 bottom edge (v=680),170.0,RL,L5 right edge (u=559.5),190.0

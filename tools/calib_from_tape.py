@@ -121,14 +121,14 @@ def calibrate(img, canny=(50, 150)):
 
 def calibrate_dataset(data, canny):
     """데이터셋의 사진마다 테이프로 카메라 자세를 다시 구해 poses.csv 카메라 열을 바꾼다.
-    처음 실행할 때 원본을 poses_calib_once.csv로 남기고, 사진별 결과는 calib_per_image.csv에 기록한다.
+    실행할 때마다 지금의 poses.csv를 읽어 카메라 열만 바꾼다 (사진이 늘어난 뒤 다시 실행해도 됨).
+    poses_calib_once.csv에는 바꾸기 전의 poses.csv를 남기고, 사진별 결과는 calib_per_image.csv에 기록한다.
     (촬영 중 카메라를 건드려도 평가가 맞게 되도록. 정답 자세는 테이프 기준 실측이라 그대로 둔다.)"""
     data = Path(data)
     src = data / 'poses.csv'
     backup = data / 'poses_calib_once.csv'
-    if not backup.exists():
-        backup.write_text(src.read_text())
-    with open(backup) as fh:
+    backup.write_text(src.read_text())               # 바꾸기 전 상태 (사진 수가 늘어도 항상 최신 목록 기준)
+    with open(src) as fh:
         rows = list(csv.DictReader(fh))
         fields = list(rows[0].keys())
     ref = G.Camera(CAM_POS0, CAM_QUAT0)
