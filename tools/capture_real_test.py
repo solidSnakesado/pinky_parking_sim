@@ -234,7 +234,8 @@ def pose_ok(pose, cam):
 def make_plan(cam, seed=600, count=40):
     """40자세: 칸 안 16, 칸 앞 접근 12, 입구 통로 6, 가로 통로 6. 각각 테이프 여유·화면 안·측정 가능 확인.
     순서는 앞 20개(1차)와 뒤 20개(2차)가 각각 같은 비율(8 / 6 / 3 / 3)이 되게 정렬한다.
-    count=20이면 1차 20개만 쓰고, 나중에 count=40으로 다시 실행하면 같은 번호로 2차 20개를 이어서 찍는다."""
+    2차는 다시 10개씩(2-1차: 21~30번, 2-2차: 31~40번) 나눠, 각 10개가 칸 안 4 / 접근 3 / 입구·통로 3이 되게 한다.
+    count=20 / 30 / 40은 앞에서부터 그 개수만 쓴다. 번호는 항상 같아서 늘려 가며 이어 찍을 수 있다."""
     half = False
     rng = np.random.default_rng(seed)
     plan = []
@@ -274,7 +275,14 @@ def make_plan(cam, seed=600, count=40):
         else:
             first += items[:len(items) // 2]
             second += items[len(items) // 2:]
-    return (first + second)[:count]
+    # 2차를 10개씩 나누기: 칸 안 8개는 칸마다 앞/뒤를 엇갈리게(A앞 B뒤 C앞 D뒤 / A뒤 B앞 C뒤 D앞)
+    sp = [p for p in second if p['kind'] == 'parked']
+    sa = [p for p in second if p['kind'] == 'approach']
+    se = [p for p in second if p['kind'] == 'entrance']
+    sf = [p for p in second if p['kind'] == 'free']
+    part1 = [sp[0], sp[3], sp[4], sp[7]] + sa[:3] + se[:2] + sf[:1]
+    part2 = [sp[1], sp[2], sp[5], sp[6]] + sa[3:] + se[2:] + sf[1:]
+    return (first + part1 + part2)[:count]
 
 
 def describe(meas, pose):
@@ -323,8 +331,8 @@ def main():
     ap.add_argument('--calib', default='config/ceiling_camera_calib.json')
     ap.add_argument('--out', default='~/dev_ws/pinky_parking_sim/datasets/real_test')
     ap.add_argument('--seed', type=int, default=600, help='seed for the target pose list')
-    ap.add_argument('--count', type=int, default=40, choices=[20, 40],
-                    help='poses to use: 20 = first batch, 40 = both batches (same numbering)')
+    ap.add_argument('--count', type=int, default=40, choices=[20, 30, 40],
+                    help='poses to use from the start of the list: 20 / 30 / 40 (same numbering)')
     ap.add_argument('--plan-only', action='store_true', help='print the pose list and measurement guide, then exit')
     args = ap.parse_args()
 
