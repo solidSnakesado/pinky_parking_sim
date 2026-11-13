@@ -14,8 +14,8 @@
            브리지 -> ceiling_cam_sim_node (천장 영상) -> pose_perception_node (인식 + 필터 -> /perceived_pose)
            -> 정책 노드는 추정 자세를 관측에 씀 (노이즈 추가 없음). 판정은 계속 정답 자세로 함.
            세 노드를 판마다 새로 띄우고, 로그는 ros_logs/{camera,perception}_XXX.log.
-           카메라·인식 노드는 낮은 우선순위(nice, --helper-nice)로 실행해 정책 노드·브리지가 CPU를 먼저 쓰게 함
-           (CPU를 나눠 쓰다 명령이 수백 ms 끊기는 것 방지). 정책 노드는 추정 자세가 --stale-ms보다 오래되면 정지
+           --helper-nice N이면 카메라·인식 노드를 낮은 우선순위(nice)로 실행 (기본 0 = 끔: 5070 Ti WSL에서 nice 10이
+           오히려 명령 끊김 판을 늘리고 접촉을 만듦, 20판 비교 8 vs 2판). 정책 노드는 추정 자세가 --stale-ms보다 오래되면 정지
            요약에 인식 오차(정책이 본 자세 vs 정답), 인식 지연(시뮬 시간), 인식 처리 시간, 검출률을 더함
 
 --dry-run: ROS 없이 같은 로직을 MuJoCo 물리에 직접 연결해 실행 (브리지와 같은 10 ms 물리, 50 Hz 자세,
@@ -163,8 +163,8 @@ def main():
     ap.add_argument('--perception', choices=['none', 'pa', 'ps'], default='none',
                     help='drive on perceived pose (ceiling camera sim + recognition node) instead of ground truth')
     ap.add_argument('--weights', default=None, help='YOLO-seg weights for --perception ps')
-    ap.add_argument('--helper-nice', type=int, default=10,
-                    help='nice level for camera / perception nodes with --perception (0 = same priority)')
+    ap.add_argument('--helper-nice', type=int, default=0,
+                    help='nice level for camera / perception nodes with --perception (0 = same priority, default)')
     ap.add_argument('--stale-ms', type=float, default=200.0,
                     help='with --perception: policy node stops (0, 0) when the estimated pose is older than this (ms, 0 = off)')
     args = ap.parse_args()
