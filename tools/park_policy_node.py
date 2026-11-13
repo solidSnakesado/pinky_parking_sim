@@ -12,7 +12,9 @@
   실물 핑키도 같은 /cmd_vel을 받으므로, 자세 입력만 인식 노드로 바꾸면 실물에서도 그대로 쓴다.
 
 한 판의 단계 (ParkEpisode, ROS와 무관한 로직)
-  0. wait   : (추정 자세 사용 시) 인식 노드의 첫 추정 자세가 올 때까지 정지 (필터는 정지 상태에서 시작해야 함)
+  0. wait   : (추정 자세 사용 시) 인식 노드의 첫 추정 자세가 올 때까지 정지 (필터는 정지 상태에서 시작해야 함).
+              준비된 뒤에도 settle_s(시뮬 시간)만큼 더 정지한다 (시작 대기). Fast DDS는 노드가 새로 뜬 뒤 첫 정기
+              참가자 알림(기본 3초) 때 받는 쪽 프로세스의 수신이 약 340 ms 멈추므로, 그 시점이 지난 뒤 주행한다
   1. turn   : 출발 방향(start_yaw)까지 제자리 회전 (브리지는 출발 위치만 정할 수 있어서)
   2. policy : 시뮬 시간 0.1초마다 관측 -> 정책 -> 명령 (그 사이에는 같은 명령 유지)
               (추정 자세 사용 시) 추정 자세의 나이(지금 시각 - 추정 자세 시각)가 stale_s보다 크면 정책 대신
@@ -20,10 +22,15 @@
   3. 끝     : 성공(정지 + 좌우·깊이 <= 20 mm, 방향 <= 5°), 테이프 접촉, 이탈, 60초 초과
   자세가 들어올 때마다(50 Hz) 접촉을 확인하고, 성공·이탈은 0.1초 경계에서 확인 (학습 환경과 같은 순서)
 
+자세 끊김 안전장치 (ParkPolicyNode, 실제 시간 50 Hz 타이머)
+  주행에 쓰는 입력(추정 자세 사용 시 그 토픽, 아니면 /ground_truth)을 마지막으로 받은 뒤 pose_timeout_s(실제 시간)가
+  지나면 정지 명령 (0, 0)을 낸다. 메시지가 아예 오지 않는 끊김(위의 Fast DDS 멈춤, 주행 중 새 노드가 붙을 때 등)에서
+  로봇이 옛 명령으로 계속 움직이지 않게 하기 위함. 위의 오래된 자세 감시는 메시지가 들어올 때만 동작해서 이 경우를 못 막음
+
 토픽
   구독: /ground_truth (geometry_msgs/PoseStamped, 시뮬 시간 도장), /odom (nav_msgs/Odometry, 현재 속도),
         (선택) 추정 자세 토픽 (geometry_msgs/PoseStamped, 영상 시각 도장)
-  발행: /cmd_vel (geometry_msgs/Twist), 자세가 들어올 때마다 (브리지 명령 끊김 0.5초 방지)
+  발행: /cmd_vel (geometry_msgs/Twist, --cmd-topic으로 바꿀 수 있음), 자세가 들어올 때마다 (브리지 명령 끊김 0.5초 방지)
 
 사용법 (pinky_train 가상환경, ROS 2 + 이 작업 공간 source, 브리지가 실행 중일 때):
   python tools/park_policy_node.py --policy runs/rl/bc_ppo_seed0/policy_last.npz --slot B --mode rear
@@ -51,20 +58,24 @@ TURN_SETTLE_W = 0.05               # 회전이 멈췄다고 볼 각속도 (rad/s
 GAP_LOG_S = 0.1                    # 자세 메시지 사이 실제 시간 간격이 이보다 크면 끊김으로 기록 (초)
 BURST_S = 0.005                    # 끊김 뒤 이보다 짧은 간격으로 몰려 온 메시지 = 밀렸다가 한꺼번에 처리된 것
 STALE_S = 0.2                      # 추정 자세가 이보다 오래되면 정지 (오래된 자세 감시, 초)
+SETTLE_S = 3.5                     # 준비된 뒤 주행 시작까지 기다리는 시뮬 시간 (초, Fast DDS 첫 정기 알림 3초를 넘기기 위함)
+POSE_TIMEOUT_S = 0.15              # 주행 입력이 이 실제 시간보다 오래 안 오면 정지 명령 (초)
 
 
 class ParkEpisode:
     """한 판의 주행 로직 (ROS와 무관). on_state(시뮬 시간, 정답 자세, 오도메트리 속도) -> (v, w)."""
 
     def __init__(self, policy, slot, mode, start_yaw=None, noise='ps', seed=0, use_est=False, stale_s=STALE_S,
-                 trace=False):
+                 trace=False, settle_s=0.0):
         self.policy, self.slot, self.mode = policy, slot, mode
         self.start_yaw = start_yaw
         self.target = target_pose(slot, mode)
         self.use_est = use_est                    # True: 관측에 추정 자세 사용 (노이즈를 더하지 않음)
         self.errors = load_ps_errors() if noise == 'ps' and not use_est else None
         self.rng = np.random.default_rng(seed)
-        self.phase = 'wait' if use_est else ('turn' if start_yaw is not None else 'policy')
+        self.settle_s = settle_s                  # 준비된 뒤 주행 시작까지 기다리는 시뮬 시간 (초)
+        self.ready_t = None                       # 준비된 시각 (추정 자세 사용 시 첫 추정 자세, 아니면 첫 자세)
+        self.phase = 'wait' if (use_est or settle_s > 0) else ('turn' if start_yaw is not None else 'policy')
         self.est_err_mm, self.est_err_deg, self.est_age_ms = [], [], []   # 정책이 쓴 추정 자세의 오차·나이
         self.stale_s = stale_s                    # 오래된 자세 기준 (초, 0 이하면 감시 끔)
         self.stale_steps = 0                      # 오래된 자세 때문에 정지한 정책 단계 수 (0.1초 단위)
@@ -115,7 +126,11 @@ class ParkEpisode:
             return 0.0, 0.0
         pose = np.asarray(pose, float)
         if self.phase == 'wait':
-            if est is None:
+            if self.use_est and est is None:
+                return 0.0, 0.0
+            if self.ready_t is None:
+                self.ready_t = t
+            if t - self.ready_t < self.settle_s:             # 시작 대기 (정지 유지)
                 return 0.0, 0.0
             self.phase = 'turn' if self.start_yaw is not None else 'policy'
             if self.phase == 'policy':
@@ -175,8 +190,10 @@ class ParkEpisode:
         return self.command
 
 
-def make_node(episode, name='park_policy', est_topic=None):
-    """ParkEpisode를 ROS 2 노드로 감싼다 (rclpy.init() 이후 호출). est_topic: 추정 자세 토픽 (없으면 정답만)."""
+def make_node(episode, name='park_policy', est_topic=None, pose_timeout_s=POSE_TIMEOUT_S, cmd_topic='/cmd_vel'):
+    """ParkEpisode를 ROS 2 노드로 감싼다 (rclpy.init() 이후 호출). est_topic: 추정 자세 토픽 (없으면 정답만).
+    pose_timeout_s: 주행 입력이 이 실제 시간(초)보다 오래 안 오면 정지 명령 (0 이하면 끔).
+    cmd_topic: 명령을 내는 토픽. 실물에서 핑키의 명령 감시 노드(cmd_vel_watchdog.py)를 거칠 때는 /cmd_vel_policy."""
     from rclpy.node import Node
     from geometry_msgs.msg import PoseStamped, Twist
     from nav_msgs.msg import Odometry
@@ -188,20 +205,26 @@ def make_node(episode, name='park_policy', est_topic=None):
             self.twist = (0.0, 0.0)
             self.got_odom = False
             self.first_pose = None
-            self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
+            self.pub = self.create_publisher(Twist, cmd_topic, 10)
             self.create_subscription(Odometry, '/odom', self.on_odom, 10)
             self.create_subscription(PoseStamped, '/ground_truth', self.on_truth, 10)
             self.est, self.est_t = None, None
             if est_topic:
                 self.create_subscription(PoseStamped, est_topic, self.on_est, 10)
             self.compute_ms, self.pub_wall = [], []
+            self.policy_ms, self.publish_ms = [], []      # 처리 시간을 정책 계산과 명령 발행(publish)으로 나눠 기록
             # 끊김 기록: 자세 메시지 사이 실제 시간 간격이 GAP_LOG_S보다 큰 경우마다
             #   wall = 실제 시간 간격, sim = 같은 두 메시지의 시뮬 시간 간격, at = 판 시작(첫 자세) 후 시뮬 시간,
             #   phase = 그때 단계, burst = 끊김 뒤 몰려 온 메시지 수
             # 해석: sim ~20 ms + burst 0 -> 브리지(시뮬)가 멈춤, sim ~20 ms + burst 많음 -> 이 노드 쪽이 멈췄다가
             #       밀린 메시지를 한꺼번에 처리 (그동안 시뮬은 옛 명령으로 진행), sim ~= wall -> 메시지가 버려짐
             self.gap_events = []
-            self.prev_wall = self.prev_t = self.first_t = None
+            self.prev_wall = self.prev_t = self.first_t = self.prev_pose = None
+            # 자세 끊김 안전장치: 주행 입력(추정 자세 또는 정답 자세)을 마지막으로 받은 실제 시각을 50 Hz로 확인
+            self.last_input = None
+            self.timeout_events, self.timeout_pubs, self.timeout_max_ms, self.in_timeout = 0, 0, 0.0, False
+            if pose_timeout_s > 0:
+                self.create_timer(0.02, self.on_watch)
 
         @staticmethod
         def _pose(msg):
@@ -212,6 +235,26 @@ def make_node(episode, name='park_policy', est_topic=None):
 
         def on_est(self, msg):
             self.est_t, self.est = self._pose(msg)
+            self._input_seen()
+
+        def _input_seen(self):
+            self.last_input = time.monotonic()
+            self.in_timeout = False
+
+        def on_watch(self):
+            """주행 입력이 pose_timeout_s보다 오래 안 오면 정지 명령 (대기 단계, 판이 끝난 뒤는 제외)."""
+            ep = self.episode
+            if self.last_input is None or ep.result is not None or ep.phase == 'wait':
+                return
+            age = time.monotonic() - self.last_input
+            if age <= pose_timeout_s:
+                return
+            self.pub.publish(Twist())
+            self.timeout_pubs += 1
+            self.timeout_max_ms = max(self.timeout_max_ms, age * 1000)
+            if not self.in_timeout:
+                self.timeout_events += 1
+                self.in_timeout = True
 
         def on_odom(self, msg):
             self.twist = (msg.twist.twist.linear.x, msg.twist.twist.angular.z)
@@ -224,22 +267,31 @@ def make_node(episode, name='park_policy', est_topic=None):
             t, pose = self._pose(msg)
             if self.first_pose is None:
                 self.first_pose = pose
-            self._log_gap(time.monotonic(), t)
+            if not est_topic:                               # 정답 자세가 주행 입력일 때
+                self._input_seen()
+            self._log_gap(time.monotonic(), t, pose)
+            c1 = time.perf_counter()
             v, w = self.episode.on_state(t, pose, self.twist, self.est, self.est_t)
             cmd = Twist()
             cmd.linear.x, cmd.angular.z = float(v), float(w)
+            c2 = time.perf_counter()
             self.pub.publish(cmd)
-            self.compute_ms.append((time.perf_counter() - c0) * 1000)
+            c3 = time.perf_counter()
+            self.policy_ms.append((c2 - c1) * 1000)
+            self.publish_ms.append((c3 - c2) * 1000)
+            self.compute_ms.append((c3 - c0) * 1000)
             self.pub_wall.append(time.monotonic())
 
-        def _log_gap(self, wall, t):
-            """자세 메시지 간격 확인 -> 끊김 기록, 끊김 직후 몰려 온 메시지 수 세기."""
+        def _log_gap(self, wall, t, pose):
+            """자세 메시지 간격 확인 -> 끊김 기록, 끊김 직후 몰려 온 메시지 수 세기.
+            moved = 끊김 앞뒤 두 메시지 사이에 로봇이 실제로 움직인 거리 (mm). 안전장치의 정지 명령이 전달되면 작아짐."""
             if self.prev_wall is not None:
                 gap = wall - self.prev_wall
                 if gap > GAP_LOG_S:
+                    moved = math.hypot(pose[0] - self.prev_pose[0], pose[1] - self.prev_pose[1]) * 1000
                     self.gap_events.append({'clock': time.time(), 'wall_ms': gap * 1000, 'sim_ms': (t - self.prev_t) * 1000,
                                             'at_s': t - self.first_t, 'phase': self.episode.phase, 'burst': 0,
-                                            'open': True})
+                                            'moved_mm': moved, 'open': True})
                 elif self.gap_events and self.gap_events[-1]['open']:
                     if gap < BURST_S:
                         self.gap_events[-1]['burst'] += 1
@@ -247,7 +299,7 @@ def make_node(episode, name='park_policy', est_topic=None):
                         self.gap_events[-1]['open'] = False
             else:
                 self.first_t = t
-            self.prev_wall, self.prev_t = wall, t
+            self.prev_wall, self.prev_t, self.prev_pose = wall, t, pose
 
         def stop(self):
             for _ in range(3):
@@ -257,8 +309,13 @@ def make_node(episode, name='park_policy', est_topic=None):
             """명령 발행 간격 (실제 시간, ms)과 노드 처리 시간 (ms) 통계."""
             gaps = np.diff(self.pub_wall) * 1000 if len(self.pub_wall) > 1 else np.zeros(1)
             comp = np.array(self.compute_ms or [0.0])
+            pol = np.array(self.policy_ms or [0.0])
+            pub = np.array(self.publish_ms or [0.0])
             out = {'cmd_gap_mean_ms': float(gaps.mean()), 'cmd_gap_max_ms': float(gaps.max()),
-                   'compute_mean_ms': float(comp.mean()), 'compute_max_ms': float(comp.max())}
+                   'compute_mean_ms': float(comp.mean()), 'compute_max_ms': float(comp.max()),
+                   'policy_max_ms': float(pol.max()),                    # 정책 계산 (on_state) 최대
+                   'publish_mean_ms': float(pub.mean()), 'publish_max_ms': float(pub.max()),   # 명령 발행 최대
+                   'publish_slow': int((pub > 50).sum())}                # 발행이 50 ms 넘게 걸린 횟수
             ep = self.episode
             if ep.est_err_mm:                         # 추정 자세 사용 시: 정책이 본 자세의 오차와 지연
                 out.update(est_err_mean_mm=float(np.mean(ep.est_err_mm)), est_err_p95_mm=float(np.percentile(ep.est_err_mm, 95)),
@@ -267,9 +324,12 @@ def make_node(episode, name='park_policy', est_topic=None):
                 out.update(est_age_mean_ms=float(np.mean(ep.est_age_ms)), est_age_max_ms=float(np.max(ep.est_age_ms)))
             out['n_gaps'] = len(self.gap_events)
             if self.gap_events:                       # 예: w340/s20/b16@12.3s:policy[17:40:01.234] ([] = 실제 시각)
-                out['gap_events'] = ';'.join(f"w{e['wall_ms']:.0f}/s{e['sim_ms']:.0f}/b{e['burst']}@{e['at_s']:.1f}s:{e['phase']}"
+                out['gap_events'] = ';'.join(f"w{e['wall_ms']:.0f}/s{e['sim_ms']:.0f}/b{e['burst']}/m{e['moved_mm']:.1f}mm"
+                                             f"@{e['at_s']:.1f}s:{e['phase']}"
                                              f"[{datetime.fromtimestamp(e['clock']).strftime('%H:%M:%S.%f')[:-3]}]"
                                              for e in self.gap_events)
+            out.update(timeout_events=self.timeout_events, timeout_pubs=self.timeout_pubs,   # 자세 끊김 안전장치
+                       timeout_max_ms=self.timeout_max_ms)
             if ep.use_est:                            # 오래된 자세 감시 결과
                 out.update(stale_steps=ep.stale_steps, stale_hits=ep.stale_hits, stale_max_ms=ep.stale_max_ms)
             return out
@@ -289,12 +349,18 @@ def main():
     ap.add_argument('--est-topic', default=None, help='use estimated pose from this topic for the policy, e.g. /perceived_pose')
     ap.add_argument('--stale-ms', type=float, default=STALE_S * 1000,
                     help='with --est-topic: stop (0, 0) when the estimated pose is older than this (ms, 0 = off)')
+    ap.add_argument('--settle-s', type=float, default=SETTLE_S,
+                    help='after ready, stay stopped this many sim seconds before driving (Fast DDS discovery, 0 = off)')
+    ap.add_argument('--pose-timeout-ms', type=float, default=POSE_TIMEOUT_S * 1000,
+                    help='publish stop (0, 0) when the driving input has not arrived for this long (real ms, 0 = off)')
+    ap.add_argument('--cmd-topic', default='/cmd_vel',
+                    help='command topic (/cmd_vel_policy when cmd_vel_watchdog.py runs on the robot)')
     args = ap.parse_args()
     ep = ParkEpisode(NumpyPolicy(args.policy), 'ABCD'.index(args.slot), args.mode,
                      None if args.start_yaw_deg is None else math.radians(args.start_yaw_deg), args.noise, args.seed,
-                     use_est=args.est_topic is not None, stale_s=args.stale_ms / 1000)
+                     use_est=args.est_topic is not None, stale_s=args.stale_ms / 1000, settle_s=args.settle_s)
     rclpy.init()
-    node = make_node(ep, est_topic=args.est_topic)
+    node = make_node(ep, est_topic=args.est_topic, pose_timeout_s=args.pose_timeout_ms / 1000, cmd_topic=args.cmd_topic)
     try:
         while rclpy.ok() and ep.result is None:
             rclpy.spin_once(node, timeout_sec=0.1)

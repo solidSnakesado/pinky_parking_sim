@@ -134,6 +134,8 @@ def run_ros(policy, slot, mode, start, noise, seed, k, args, tmp, logdir):
     from ament_index_python.packages import get_package_share_directory
     cfg = yaml.safe_load((Path(get_package_share_directory('pinky_mujoco')) / 'config/mujoco.yaml').read_text())
     cfg['spawn']['position'] = [float(start[0]), float(start[1]), SPAWN_Z]
+    if args.cmd_timeout > 0 and cfg.get('control') is not None:   # 받는 쪽(브리지)이 명령 끊김 시 멈추는 시간
+        cfg['control']['command_timeout'] = float(args.cmd_timeout)
     if cfg.get('camera'):
         cfg['camera']['enabled'] = False
     cfg_path = Path(tmp) / f'physics_{k}.yaml'
@@ -154,10 +156,18 @@ def run_ros(policy, slot, mode, start, noise, seed, k, args, tmp, logdir):
         for name, cmd in (('camera', nice + cam_cmd), ('perception', nice + perc_cmd)):
             lg = open(logdir / f'{name}_{k:03d}.log', 'w')
             helpers.append((subprocess.Popen(cmd, stdout=lg, stderr=subprocess.STDOUT), lg))
+    if args.watchdog:                                   # 명령 감시 노드 (실물에서는 핑키에서 실행): /cmd_vel_policy -> /cmd_vel
+        tools = Path(__file__).resolve().parent
+        wd_cmd = [sys.executable, str(tools / 'cmd_vel_watchdog.py'), '--timeout-ms', str(args.watchdog_ms),
+                  '--stats-file', str(Path(tmp) / f'watchdog_{k}.json')]
+        lg = open(logdir / f'watchdog_{k:03d}.log', 'w')
+        helpers.append((subprocess.Popen(wd_cmd, stdout=lg, stderr=subprocess.STDOUT), lg))
     use_est = args.perception != 'none'
     ep = ParkEpisode(policy, slot, mode, start[2], noise, seed, use_est=use_est, stale_s=args.stale_ms / 1000,
-                     trace=args.trace)
-    node = make_node(ep, name=f'park_policy_{k}', est_topic='/perceived_pose' if use_est else None)
+                     trace=args.trace, settle_s=args.settle_s)
+    node = make_node(ep, name=f'park_policy_{k}', est_topic='/perceived_pose' if use_est else None,
+                     pose_timeout_s=args.pose_timeout_ms / 1000,
+                     cmd_topic='/cmd_vel_policy' if args.watchdog else '/cmd_vel')
     t_start = time.monotonic()
     info, timing = None, {}
     stall_path = logdir / f'stall_{k:03d}.log'            # 끊김 조사 기록 (끊김이 있던 판에만 생김)
@@ -205,6 +215,9 @@ def run_ros(policy, slot, mode, start, noise, seed, k, args, tmp, logdir):
             lg.close()
     if stats_path.is_file():
         timing.update({k2: v for k2, v in json.loads(stats_path.read_text()).items() if k2 != 'method'})
+    wd_path = Path(tmp) / f'watchdog_{k}.json'
+    if wd_path.is_file():                                 # 명령 감시 노드 통계 (wd_ 접두어)
+        timing.update({f'wd_{k2}': v for k2, v in json.loads(wd_path.read_text()).items()})
     timing['wall_s'] = time.monotonic() - t_start
     return info or ep.info, timing
 
@@ -225,6 +238,19 @@ def main():
     ap.add_argument('--perception', choices=['none', 'pa', 'ps'], default='none',
                     help='drive on perceived pose (ceiling camera sim + recognition node) instead of ground truth')
     ap.add_argument('--weights', default=None, help='YOLO-seg weights for --perception ps')
+    ap.add_argument('--settle-s', type=float, default=3.5,
+                    help='after all nodes are ready (first estimated pose), stay stopped this many sim seconds before '
+                         'driving: Fast DDS stalls the receiving process ~340 ms at the first periodic discovery '
+                         'announcement (3 s) of newly started nodes (0 = off)')
+    ap.add_argument('--pose-timeout-ms', type=float, default=150.0,
+                    help='policy node publishes stop (0, 0) when its driving input has not arrived for this long '
+                         '(real ms, 0 = off)')
+    ap.add_argument('--cmd-timeout', type=float, default=0.2,
+                    help='override the bridge command_timeout (s): the simulated robot stops by itself when no '
+                         'command arrived for this long, like a robot-side watchdog (pinky_mujoco default 0.5, 0 = keep)')
+    ap.add_argument('--watchdog', action='store_true',
+                    help='run cmd_vel_watchdog.py each episode: policy -> /cmd_vel_policy -> watchdog -> /cmd_vel')
+    ap.add_argument('--watchdog-ms', type=float, default=200.0, help='watchdog timeout (ms)')
     ap.add_argument('--trace', action='store_true',
                     help='save per policy step true / seen pose and command to ros_logs/trace_XXX.csv (plot_trace.py)')
     ap.add_argument('--helper-nice', type=int, default=0,
@@ -272,7 +298,8 @@ def main():
             el = time.time() - t0
             eta = el / len(rows) * (args.episodes - args.first - len(rows))
             extra = (f"  cmd gap {timing['cmd_gap_mean_ms']:.0f}/{timing['cmd_gap_max_ms']:.0f} ms, "
-                     f"compute {timing['compute_mean_ms']:.1f} ms" if 'cmd_gap_mean_ms' in timing else '')
+                     f"compute {timing['compute_mean_ms']:.1f} ms, timeout stops {timing.get('timeout_events', 0)}"
+                     if 'cmd_gap_mean_ms' in timing else '')
             if 'est_err_mean_mm' in timing:
                 extra += (f", est err {timing['est_err_mean_mm']:.1f} mm / {timing['est_err_mean_deg']:.1f} deg, "
                           f"age {timing.get('est_age_mean_ms', float('nan')):.0f} ms, "
@@ -281,6 +308,10 @@ def main():
             print(f"  [{k + 1:4d}/{args.episodes}] {'ABCD'[slot]} {mode:5s} -> {row['result']:12s} "
                   f"t={row['time_s'] if row['time_s'] == row['time_s'] else 0:5.1f} s | success {n_ok}/{len(rows)} "
                   f"| {el / 60:.1f} min, ~{eta / 60:.1f} min left{extra}", flush=True)
+            if timing.get('publish_slow', 0) or timing.get('wd_timeout_events', 0):   # 발행 지연, 명령 감시 노드 정지
+                print(f"           publish max {timing.get('publish_max_ms', 0):.0f} ms (slow {timing.get('publish_slow', 0)}), "
+                      f"policy max {timing.get('policy_max_ms', 0):.1f} ms, "
+                      f"watchdog stops {timing.get('wd_timeout_events', 0)}", flush=True)
             if timing.get('gap_events'):                     # 끊김 기록 (실제/시뮬 간격, 몰려 온 수, 시점, 단계)
                 print(f"           gaps > 100 ms: {timing['gap_events']}", flush=True)
             if timing.get('trace'):
@@ -313,6 +344,13 @@ def main():
                   f"{np.mean([r['compute_mean_ms'] for r in g]):.2f} ms (max {max(r['compute_max_ms'] for r in g):.1f} ms), "
                   f"wall per episode {np.mean([r['wall_s'] for r in g]):.0f} s, "
                   f"spawn error max {max(r.get('spawn_error_mm', 0) for r in g):.1f} mm")
+            print(f"publish (policy node): mean {np.mean([r.get('publish_mean_ms', 0) for r in g]):.2f} ms, "
+                  f"max {max(r.get('publish_max_ms', 0) for r in g):.0f} ms, "
+                  f"episodes with a publish > 50 ms {sum(1 for r in g if r.get('publish_slow', 0) > 0)}/{len(g)}; "
+                  f"policy step max {max(r.get('policy_max_ms', 0) for r in g):.1f} ms; "
+                  f"bridge command_timeout {args.cmd_timeout if args.cmd_timeout > 0 else 'default'} s"
+                  + (f"; watchdog ({args.watchdog_ms:.0f} ms) stops {sum(r.get('wd_timeout_events', 0) for r in g)}"
+                     if args.watchdog else ''))
         e = [r for r in rows if 'est_err_mean_mm' in r]
         if e:
             print(f"perception ({args.perception}): pose error seen by the policy mean "
@@ -323,6 +361,10 @@ def main():
                   f"compute mean {np.nanmean([r.get('perc_compute_mean_ms', np.nan) for r in e]):.1f} ms, "
                   f"detect rate {np.nanmean([r.get('detect_rate', np.nan) for r in e]):.1%}")
             st = [r for r in e if r.get('stale_hits', 0) > 0]
+            print(f"pose timeout guard ({args.pose_timeout_ms:.0f} ms): "
+                  f"{sum(1 for r in e if r.get('timeout_events', 0) > 0)}/{len(e)} episodes hit it, "
+                  f"events {sum(r.get('timeout_events', 0) for r in e)}, stop commands {sum(r.get('timeout_pubs', 0) for r in e)}, "
+                  f"settle {args.settle_s:.1f} s")
             print(f"stale pose guard ({args.stale_ms:.0f} ms, helper nice {args.helper_nice}): "
                   f"{len(st)}/{len(e)} episodes hit it, stopped policy steps total "
                   f"{sum(r.get('stale_steps', 0) for r in e)}, max pose age {max([r.get('stale_max_ms', 0) for r in e] or [0]):.0f} ms")
