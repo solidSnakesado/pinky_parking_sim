@@ -104,19 +104,27 @@ def calibrate(img, canny=(50, 150)):
     dist = np.minimum(cv2.distanceTransform(255 - edges, cv2.DIST_L2, 5), DIST_CAP).astype(np.float64)
 
     cam0 = G.Camera(CAM_POS0, CAM_QUAT0)
-    world = tape_world_points()
-    pix0 = cam0.project(world)
-    keep = (pix0[:, 0] > 10) & (pix0[:, 0] < G.WIDTH - 10) & (pix0[:, 1] > 10) & (pix0[:, 1] < G.HEIGHT - 10)
-    world = world[keep]                              # 처음에 화면 안에 있는 점만 씀 (점 집합 고정)
+    world_all = tape_world_points()
 
-    def residual(p):
-        return sample(dist, camera_from_params(p, cam0).project(world))
+    def visible(cam, margin):
+        pix = cam.project(world_all)
+        return world_all[(pix[:, 0] > margin) & (pix[:, 0] < G.WIDTH - margin)
+                         & (pix[:, 1] > margin) & (pix[:, 1] < G.HEIGHT - margin)]
 
-    r0 = residual(np.zeros(6))
+    # 1차: 시뮬 카메라 기준으로 화면 안의 점 / 2차: 1차 결과 카메라 기준으로 다시 고름
+    # (카메라가 많이 움직이면 시뮬 기준 점 일부가 실제 화면 밖이라 잔차가 부풀고 맞춤이 흔들리기 때문)
+    world = visible(cam0, 10)
+    r0 = None
     p = np.zeros(6)
-    for f_scale in (8.0, 3.0, 1.0):                  # 넓은 범위 -> 좁은 범위로 (지역 최소 회피)
-        p = least_squares(residual, p, loss='soft_l1', f_scale=f_scale, x_scale=[0.01] * 3 + [0.005] * 3).x
-    return camera_from_params(p, cam0), r0, residual(p), p
+    for stage in range(2):
+        def residual(q, world=world):
+            return sample(dist, camera_from_params(q, cam0).project(world))
+        if r0 is None:
+            r0 = residual(np.zeros(6))
+        for f_scale in (8.0, 3.0, 1.0):              # 넓은 범위 -> 좁은 범위로 (지역 최소 회피)
+            p = least_squares(residual, p, loss='soft_l1', f_scale=f_scale, x_scale=[0.01] * 3 + [0.005] * 3).x
+        world = visible(camera_from_params(p, cam0), 10)
+    return camera_from_params(p, cam0), r0, sample(dist, camera_from_params(p, cam0).project(world)), p
 
 
 def calibrate_dataset(data, canny):
