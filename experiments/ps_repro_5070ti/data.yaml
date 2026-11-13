@@ -1,0 +1,8 @@
+path: datasets/parking_seg_v2_5070ti
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: wheel
+  1: line
+  2: body
