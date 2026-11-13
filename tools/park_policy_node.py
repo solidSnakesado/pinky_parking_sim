@@ -15,6 +15,8 @@
   0. wait   : (추정 자세 사용 시) 인식 노드의 첫 추정 자세가 올 때까지 정지 (필터는 정지 상태에서 시작해야 함)
   1. turn   : 출발 방향(start_yaw)까지 제자리 회전 (브리지는 출발 위치만 정할 수 있어서)
   2. policy : 시뮬 시간 0.1초마다 관측 -> 정책 -> 명령 (그 사이에는 같은 명령 유지)
+              (추정 자세 사용 시) 추정 자세의 나이(지금 시각 - 추정 자세 시각)가 stale_s보다 크면 정책 대신
+              정지 명령 (0, 0)을 내고 그 횟수를 기록한다 (오래된 자세 감시. 인식 노드·통신이 멈췄을 때 보호)
   3. 끝     : 성공(정지 + 좌우·깊이 <= 20 mm, 방향 <= 5°), 테이프 접촉, 이탈, 60초 초과
   자세가 들어올 때마다(50 Hz) 접촉을 확인하고, 성공·이탈은 0.1초 경계에서 확인 (학습 환경과 같은 순서)
 
@@ -45,12 +47,13 @@ from export_policy import NumpyPolicy  # noqa: E402
 
 TURN_TOL = math.radians(2.0)       # 출발 방향 맞추기 허용 오차
 TURN_SETTLE_W = 0.05               # 회전이 멈췄다고 볼 각속도 (rad/s)
+STALE_S = 0.2                      # 추정 자세가 이보다 오래되면 정지 (오래된 자세 감시, 초)
 
 
 class ParkEpisode:
     """한 판의 주행 로직 (ROS와 무관). on_state(시뮬 시간, 정답 자세, 오도메트리 속도) -> (v, w)."""
 
-    def __init__(self, policy, slot, mode, start_yaw=None, noise='ps', seed=0, use_est=False):
+    def __init__(self, policy, slot, mode, start_yaw=None, noise='ps', seed=0, use_est=False, stale_s=STALE_S):
         self.policy, self.slot, self.mode = policy, slot, mode
         self.start_yaw = start_yaw
         self.target = target_pose(slot, mode)
@@ -59,6 +62,10 @@ class ParkEpisode:
         self.rng = np.random.default_rng(seed)
         self.phase = 'wait' if use_est else ('turn' if start_yaw is not None else 'policy')
         self.est_err_mm, self.est_err_deg, self.est_age_ms = [], [], []   # 정책이 쓴 추정 자세의 오차·나이
+        self.stale_s = stale_s                    # 오래된 자세 기준 (초, 0 이하면 감시 끔)
+        self.stale_steps = 0                      # 오래된 자세 때문에 정지한 정책 단계 수 (0.1초 단위)
+        self.stale_hits = 0                       # 오래된 자세를 만난 자세 메시지 수 (50 Hz 단위)
+        self.stale_max_ms = 0.0                   # 정책 단계에서 본 추정 자세 나이의 최대값 (ms)
         self.t0 = self.next_act = None
         self.prev_action = np.zeros(2)
         self.command = (0.0, 0.0)
@@ -105,6 +112,11 @@ class ParkEpisode:
         if touching(*pose):                                   # 접촉은 자세가 올 때마다 확인
             self._finish('contact', t, pose, twist)
             return self.command
+        stale = (self.use_est and self.stale_s > 0 and est_t is not None and t - est_t > self.stale_s)
+        if stale:                                             # 오래된 자세: 0.1초 경계를 기다리지 않고 바로 정지
+            self.stale_hits += 1
+            self.stale_max_ms = max(self.stale_max_ms, (t - est_t) * 1000)
+            self.command = (0.0, 0.0)
         if t + 1e-6 >= self.next_act:                         # 0.1초 경계
             if self.steps > 0:
                 u, v = G.world_to_mm(pose[0], pose[1])
@@ -119,6 +131,12 @@ class ParkEpisode:
                 if self.steps * CTRL_DT >= TIME_LIMIT_S - 1e-9:
                     self._finish('timeout', t, pose, twist)
                     return self.command
+            if stale:                                         # 정책을 돌리지 않고 정지 명령 유지 (시간은 계속 셈)
+                self.prev_action = np.zeros(2)                # 실제로 낸 명령 (0, 0)을 이전 행동으로
+                self.next_act += CTRL_DT
+                self.steps += 1
+                self.stale_steps += 1
+                return self.command
             if self.use_est:
                 seen = np.asarray(est, float)
                 self.est_err_mm.append(math.hypot(seen[0] - pose[0], seen[1] - pose[1]) * 1000)
@@ -201,6 +219,8 @@ def make_node(episode, name='park_policy', est_topic=None):
                            est_err_mean_deg=float(np.mean(ep.est_err_deg)))
             if ep.est_age_ms:
                 out.update(est_age_mean_ms=float(np.mean(ep.est_age_ms)), est_age_max_ms=float(np.max(ep.est_age_ms)))
+            if ep.use_est:                            # 오래된 자세 감시 결과
+                out.update(stale_steps=ep.stale_steps, stale_hits=ep.stale_hits, stale_max_ms=ep.stale_max_ms)
             return out
 
     return ParkPolicyNode()
@@ -216,10 +236,12 @@ def main():
     ap.add_argument('--noise', choices=['ps', 'none'], default='ps')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--est-topic', default=None, help='use estimated pose from this topic for the policy, e.g. /perceived_pose')
+    ap.add_argument('--stale-ms', type=float, default=STALE_S * 1000,
+                    help='with --est-topic: stop (0, 0) when the estimated pose is older than this (ms, 0 = off)')
     args = ap.parse_args()
     ep = ParkEpisode(NumpyPolicy(args.policy), 'ABCD'.index(args.slot), args.mode,
                      None if args.start_yaw_deg is None else math.radians(args.start_yaw_deg), args.noise, args.seed,
-                     use_est=args.est_topic is not None)
+                     use_est=args.est_topic is not None, stale_s=args.stale_ms / 1000)
     rclpy.init()
     node = make_node(ep, est_topic=args.est_topic)
     try:

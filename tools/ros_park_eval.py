@@ -14,6 +14,8 @@
            브리지 -> ceiling_cam_sim_node (천장 영상) -> pose_perception_node (인식 + 필터 -> /perceived_pose)
            -> 정책 노드는 추정 자세를 관측에 씀 (노이즈 추가 없음). 판정은 계속 정답 자세로 함.
            세 노드를 판마다 새로 띄우고, 로그는 ros_logs/{camera,perception}_XXX.log.
+           카메라·인식 노드는 낮은 우선순위(nice, --helper-nice)로 실행해 정책 노드·브리지가 CPU를 먼저 쓰게 함
+           (CPU를 나눠 쓰다 명령이 수백 ms 끊기는 것 방지). 정책 노드는 추정 자세가 --stale-ms보다 오래되면 정지
            요약에 인식 오차(정책이 본 자세 vs 정답), 인식 지연(시뮬 시간), 인식 처리 시간, 검출률을 더함
 
 --dry-run: ROS 없이 같은 로직을 MuJoCo 물리에 직접 연결해 실행 (브리지와 같은 10 ms 물리, 50 Hz 자세,
@@ -103,11 +105,12 @@ def run_ros(policy, slot, mode, start, noise, seed, k, args, tmp, logdir):
         cam_cmd = [sys.executable, str(tools / 'ceiling_cam_sim_node.py'), '--seed', str(seed)]
         perc_cmd = [sys.executable, str(tools / 'pose_perception_node.py'), '--method', args.perception,
                     '--stats-file', str(stats_path)] + (['--weights', args.weights] if args.weights else [])
-        for name, cmd in (('camera', cam_cmd), ('perception', perc_cmd)):
+        nice = ['nice', '-n', str(args.helper_nice)] if args.helper_nice > 0 else []   # 낮은 우선순위로 실행
+        for name, cmd in (('camera', nice + cam_cmd), ('perception', nice + perc_cmd)):
             lg = open(logdir / f'{name}_{k:03d}.log', 'w')
             helpers.append((subprocess.Popen(cmd, stdout=lg, stderr=subprocess.STDOUT), lg))
     use_est = args.perception != 'none'
-    ep = ParkEpisode(policy, slot, mode, start[2], noise, seed, use_est=use_est)
+    ep = ParkEpisode(policy, slot, mode, start[2], noise, seed, use_est=use_est, stale_s=args.stale_ms / 1000)
     node = make_node(ep, name=f'park_policy_{k}', est_topic='/perceived_pose' if use_est else None)
     t_start = time.monotonic()
     info, timing = None, {}
@@ -160,6 +163,10 @@ def main():
     ap.add_argument('--perception', choices=['none', 'pa', 'ps'], default='none',
                     help='drive on perceived pose (ceiling camera sim + recognition node) instead of ground truth')
     ap.add_argument('--weights', default=None, help='YOLO-seg weights for --perception ps')
+    ap.add_argument('--helper-nice', type=int, default=10,
+                    help='nice level for camera / perception nodes with --perception (0 = same priority)')
+    ap.add_argument('--stale-ms', type=float, default=200.0,
+                    help='with --perception: policy node stops (0, 0) when the estimated pose is older than this (ms, 0 = off)')
     args = ap.parse_args()
     if args.perception == 'ps' and not args.weights:
         raise SystemExit('--weights is required for --perception ps')
@@ -205,7 +212,8 @@ def main():
             if 'est_err_mean_mm' in timing:
                 extra += (f", est err {timing['est_err_mean_mm']:.1f} mm / {timing['est_err_mean_deg']:.1f} deg, "
                           f"age {timing.get('est_age_mean_ms', float('nan')):.0f} ms, "
-                          f"perception {timing.get('perc_compute_mean_ms', float('nan')):.0f} ms")
+                          f"perception {timing.get('perc_compute_mean_ms', float('nan')):.0f} ms, "
+                          f"stale stops {timing.get('stale_steps', 0)}")
             print(f"  [{k + 1:4d}/{args.episodes}] {'ABCD'[slot]} {mode:5s} -> {row['result']:12s} "
                   f"t={row['time_s'] if row['time_s'] == row['time_s'] else 0:5.1f} s | success {n_ok}/{len(rows)} "
                   f"| {el / 60:.1f} min, ~{eta / 60:.1f} min left{extra}", flush=True)
@@ -244,6 +252,10 @@ def main():
                   f"(max {np.nanmax([r.get('est_age_max_ms', np.nan) for r in e]):.0f} ms), "
                   f"compute mean {np.nanmean([r.get('perc_compute_mean_ms', np.nan) for r in e]):.1f} ms, "
                   f"detect rate {np.nanmean([r.get('detect_rate', np.nan) for r in e]):.1%}")
+            st = [r for r in e if r.get('stale_hits', 0) > 0]
+            print(f"stale pose guard ({args.stale_ms:.0f} ms, helper nice {args.helper_nice}): "
+                  f"{len(st)}/{len(e)} episodes hit it, stopped policy steps total "
+                  f"{sum(r.get('stale_steps', 0) for r in e)}, max pose age {max([r.get('stale_max_ms', 0) for r in e] or [0]):.0f} ms")
 
 
 if __name__ == '__main__':
