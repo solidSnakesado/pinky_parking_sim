@@ -56,7 +56,8 @@ STALE_S = 0.2                      # 추정 자세가 이보다 오래되면 정
 class ParkEpisode:
     """한 판의 주행 로직 (ROS와 무관). on_state(시뮬 시간, 정답 자세, 오도메트리 속도) -> (v, w)."""
 
-    def __init__(self, policy, slot, mode, start_yaw=None, noise='ps', seed=0, use_est=False, stale_s=STALE_S):
+    def __init__(self, policy, slot, mode, start_yaw=None, noise='ps', seed=0, use_est=False, stale_s=STALE_S,
+                 trace=False):
         self.policy, self.slot, self.mode = policy, slot, mode
         self.start_yaw = start_yaw
         self.target = target_pose(slot, mode)
@@ -69,6 +70,7 @@ class ParkEpisode:
         self.stale_steps = 0                      # 오래된 자세 때문에 정지한 정책 단계 수 (0.1초 단위)
         self.stale_hits = 0                       # 오래된 자세를 만난 자세 메시지 수 (50 Hz 단위)
         self.stale_max_ms = 0.0                   # 정책 단계에서 본 추정 자세 나이의 최대값 (ms)
+        self.trace = [] if trace else None        # 정책 단계별 기록 (정답 자세, 정책이 본 자세, 명령), 분석용
         self.t0 = self.next_act = None
         self.prev_action = np.zeros(2)
         self.command = (0.0, 0.0)
@@ -92,6 +94,20 @@ class ParkEpisode:
                      'stopped': bool(abs(twist[0]) < STOP_V and abs(twist[1]) < STOP_W),
                      'final_v': float(twist[0]), 'final_w': float(twist[1])}
         self.command = (0.0, 0.0)
+        self._trace(t, pose, None, None)                      # 끝난 순간의 정답 자세도 기록 (접촉 위치 확인용)
+
+    def _trace(self, t, pose, seen, est_t):
+        """정책 단계 한 줄 기록 (trace를 켰을 때만). seen = 정책이 관측에 쓴 자세 (오래된 자세로 정지했으면 None)."""
+        if self.trace is None or self.t0 is None:             # 정책 단계 시작 전(wait, turn)은 기록하지 않음
+            return
+        row = {'step': self.steps, 't': round(t - self.t0, 3), 'x': pose[0], 'y': pose[1], 'yaw': pose[2],
+               'seen_x': '', 'seen_y': '', 'seen_yaw': '', 'est_age_ms': '',
+               'v': self.command[0], 'w': self.command[1], 'touching': bool(touching(*pose))}
+        if seen is not None:
+            row.update(seen_x=seen[0], seen_y=seen[1], seen_yaw=seen[2])
+        if est_t is not None:
+            row['est_age_ms'] = round((t - est_t) * 1000, 1)
+        self.trace.append(row)
 
     def on_state(self, t, pose, twist, est=None, est_t=None):
         """pose = 정답 자세 (판정용), est = 추정 자세 (use_est일 때 관측용), est_t = 추정 자세의 시각."""
@@ -139,6 +155,7 @@ class ParkEpisode:
                 self.next_act += CTRL_DT
                 self.steps += 1
                 self.stale_steps += 1
+                self._trace(t, pose, None, est_t)
                 return self.command
             if self.use_est:
                 seen = np.asarray(est, float)
@@ -152,6 +169,7 @@ class ParkEpisode:
             a = self.policy.act(obs)
             self.prev_action = a
             self.command = (float(a[0] * V_MAX), float(a[1] * W_MAX))
+            self._trace(t, pose, seen, est_t)
             self.next_act += CTRL_DT
             self.steps += 1
         return self.command

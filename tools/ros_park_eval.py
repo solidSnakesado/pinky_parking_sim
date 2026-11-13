@@ -155,7 +155,8 @@ def run_ros(policy, slot, mode, start, noise, seed, k, args, tmp, logdir):
             lg = open(logdir / f'{name}_{k:03d}.log', 'w')
             helpers.append((subprocess.Popen(cmd, stdout=lg, stderr=subprocess.STDOUT), lg))
     use_est = args.perception != 'none'
-    ep = ParkEpisode(policy, slot, mode, start[2], noise, seed, use_est=use_est, stale_s=args.stale_ms / 1000)
+    ep = ParkEpisode(policy, slot, mode, start[2], noise, seed, use_est=use_est, stale_s=args.stale_ms / 1000,
+                     trace=args.trace)
     node = make_node(ep, name=f'park_policy_{k}', est_topic='/perceived_pose' if use_est else None)
     t_start = time.monotonic()
     info, timing = None, {}
@@ -185,6 +186,13 @@ def run_ros(policy, slot, mode, start, noise, seed, k, args, tmp, logdir):
         stall_th.join(timeout=1.0)
         if stall_path.is_file():
             timing['stall_log'] = stall_path.name
+        if ep.trace:                                      # 정책 단계별 기록 (--trace)
+            tr_path = logdir / f'trace_{k:03d}.csv'
+            with open(tr_path, 'w', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=['slot', 'mode'] + list(ep.trace[0]))
+                w.writeheader()
+                w.writerows({'slot': 'ABCD'[slot], 'mode': mode, **r} for r in ep.trace)
+            timing['trace'] = tr_path.name
         node.destroy_node()
         for p_, lg in helpers + [(proc, log)]:            # 인식·카메라 노드 먼저, 브리지 마지막
             if p_.poll() is None:
@@ -217,6 +225,8 @@ def main():
     ap.add_argument('--perception', choices=['none', 'pa', 'ps'], default='none',
                     help='drive on perceived pose (ceiling camera sim + recognition node) instead of ground truth')
     ap.add_argument('--weights', default=None, help='YOLO-seg weights for --perception ps')
+    ap.add_argument('--trace', action='store_true',
+                    help='save per policy step true / seen pose and command to ros_logs/trace_XXX.csv (plot_trace.py)')
     ap.add_argument('--helper-nice', type=int, default=0,
                     help='nice level for camera / perception nodes with --perception (0 = same priority, default)')
     ap.add_argument('--stale-ms', type=float, default=200.0,
@@ -273,6 +283,8 @@ def main():
                   f"| {el / 60:.1f} min, ~{eta / 60:.1f} min left{extra}", flush=True)
             if timing.get('gap_events'):                     # 끊김 기록 (실제/시뮬 간격, 몰려 온 수, 시점, 단계)
                 print(f"           gaps > 100 ms: {timing['gap_events']}", flush=True)
+            if timing.get('trace'):
+                print(f"           trace: ros_logs/{timing['trace']}", flush=True)
             if timing.get('stall_log'):
                 print(f"           stall log: ros_logs/{timing['stall_log']}", flush=True)
             with open(out, 'w', newline='') as f:                # 판마다 저장 (중간에 멈춰도 남음)
